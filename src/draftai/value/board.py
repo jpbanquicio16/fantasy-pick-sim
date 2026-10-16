@@ -16,9 +16,15 @@ import polars as pl
 
 from draftai.features.build import COMPONENTS
 from draftai.scoring import ScoringSettings
-from draftai.value.games import DonorBank, GameProjection, GameSimulator, extra_rates, simulated_stats
+from draftai.value.games import (
+    DonorBank,
+    GameProjection,
+    GameSimulator,
+    extra_rates,
+    simulated_stats,
+)
 from draftai.value.lineup import starting_slots
-from draftai.value.lockin import EmpiricalScores, kappa
+from draftai.value.lockin import EmpiricalScores, kappa, thresholds
 from draftai.value.replacement import ReplacementLevels, replacement_levels, vor
 from draftai.value.schedule import WeekPlan, team_week_patterns
 from draftai.value.weekly import Availability, lockin_profile, weekly_values
@@ -27,6 +33,7 @@ from draftai.value.weekly import Availability, lockin_profile, weekly_values
 # status says nothing about duration. Use configs/availability_overrides.csv for specifics.
 INJURY_SHARE_MULT = {"Out": 0.85, "Doubtful": 0.95, "Questionable": 0.98, "DTD": 0.98, "Day-To-Day": 0.98}
 SEASON_DRAWS = 4000
+QUANTILE_GRID = np.linspace(0.0, 1.0, 201)  # stored game-score distribution per player
 
 
 @dataclass
@@ -38,6 +45,7 @@ class Board:
     replacement: ReplacementLevels
     roster_positions: list[str]
     teams: int
+    quantiles: np.ndarray | None = None  # (players, 201) game-score quantiles; None on old boards
 
     @property
     def slots(self) -> list[str]:
@@ -46,10 +54,32 @@ class Board:
     def positions(self) -> list[list[str]]:
         return self.players["positions"].to_list()
 
+    def game_scores(self, row: int) -> EmpiricalScores:
+        """A player's simulated game-score distribution (from the stored quantile grid)."""
+        if self.quantiles is None:
+            raise ValueError("this board predates stored game distributions; rerun `draftai project`")
+        return EmpiricalScores(self.quantiles[row])
+
+    def with_teams(self, teams: int) -> "Board":
+        """The same players for a league of a different size: replacement levels and VOR
+        depend on how many lineups the pool must fill."""
+        positions = self.positions()
+        levels = replacement_levels(self.weekly, self.weights, positions, self.roster_positions, teams)
+        v = vor(self.weekly, self.weights, positions, levels)
+        players = self.players.with_columns(
+            pl.Series("vor", v),
+            pl.Series("vor_per_week", v / max(self.weights.sum(), 1e-9)),
+            pl.Series("repl_slot", [levels.cheapest_slot(p) for p in positions]),
+        )
+        return Board(players, self.weekly, self.weeks, self.weights, levels, self.roster_positions, teams,
+                     self.quantiles)
+
     def save(self, directory: Path) -> None:
         directory.mkdir(parents=True, exist_ok=True)
         self.players.write_parquet(directory / "board.parquet")
         np.save(directory / "weekly.npy", self.weekly)
+        if self.quantiles is not None:
+            np.save(directory / "game_quantiles.npy", self.quantiles)
         meta = {
             "weeks": self.weeks,
             "weights": self.weights.tolist(),
@@ -81,6 +111,7 @@ class Board:
             replacement=rep,
             roster_positions=meta["roster_positions"],
             teams=meta["teams"],
+            quantiles=np.load(directory / "game_quantiles.npy") if (directory / "game_quantiles.npy").exists() else None,
         )
 
 
@@ -95,6 +126,15 @@ def _share_draws(p10: float, p50: float, p90: float, u: np.ndarray) -> np.ndarra
     lo0 = max(0.0, p10 - 0.5 * (p50 - p10))
     hi1 = min(1.0, p90 + 0.5 * (p90 - p50))
     return np.interp(u, [0.0, 0.1, 0.5, 0.9, 1.0], [lo0, p10, p50, p90, hi1])
+
+
+def _locked_sd(fp: np.ndarray, dist: EmpiricalScores, rng: np.random.Generator, n: int = 2000) -> float:
+    """Spread of the locked score in a three-game week under the optimal lock rule: the
+    week-to-week noise a head-to-head matchup sees from one lineup slot."""
+    t = thresholds(dist, [0.0, 0.0, 0.0])
+    x = rng.choice(fp, size=(n, 3))
+    locked = np.where(x[:, 0] >= t[0], x[:, 0], np.where(x[:, 1] >= t[1], x[:, 1], x[:, 2]))
+    return float(locked.std())
 
 
 def build_board(
@@ -133,7 +173,7 @@ def build_board(
         (pl.col("share_p50") * pl.col("inj_mult")).alias("share_p50"),
         (pl.col("share_p90") * pl.col("inj_mult")).alias("share_p90"),
     )
-    rows, weekly = [], []
+    rows, weekly, quantiles = [], [], []
     for r in proj.iter_rows(named=True):
         rates = {c: float(r[f"rate_{c}_hat"] or 0.0) for c in COMPONENTS}
         if len(stats) > len(COMPONENTS):
@@ -151,6 +191,7 @@ def build_board(
         team_pats = [patterns.get((r["team_now"], w), ()) for w in weeks]
         wk = weekly_values(dist, avail, team_pats)
         prof = lockin_profile(dist, 4)
+        lock_sd = _locked_sd(fp, dist, rng)
         season = float(wk @ weights)
         # Season-value uncertainty: calibrated FP/G and games-share quantiles.
         p50 = max(r["fp_p50"] or dist.mean, 1e-6)
@@ -171,6 +212,7 @@ def build_board(
                 "lockin_4": prof[4],
                 "lockin_premium_3": prof[3] - dist.mean,
                 "lockin_normal_3": dist.mean + kappa(3) * dist.sd,
+                "lockin_sd_3": lock_sd,
                 "avail_a": avail.a,
                 "avail_q": avail.q,
                 "games_proj": float(sum(len(p) for p in team_pats) * (r["share_hat"] or 0.0)),
@@ -182,6 +224,7 @@ def build_board(
             }
         )
         weekly.append(wk)
+        quantiles.append(np.quantile(fp, QUANTILE_GRID))
     players = pl.DataFrame(rows, infer_schema_length=None)
     W = np.vstack(weekly) if weekly else np.zeros((0, len(weeks)))
     positions = players["positions"].to_list()
@@ -194,4 +237,5 @@ def build_board(
     )
     log(f"board: {players.height} players, {len(weeks)} weeks; replacement levels "
         + ", ".join(f"{s}={levels.season_value[s]:.0f}" for s in levels.slot_types))
-    return Board(players, W, weeks, weights, levels, roster_positions, teams)
+    Q = np.vstack(quantiles) if quantiles else np.zeros((0, QUANTILE_GRID.size))
+    return Board(players, W, weeks, weights, levels, roster_positions, teams, Q)

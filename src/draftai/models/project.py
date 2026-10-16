@@ -36,7 +36,7 @@ def project_rows(feats: pl.DataFrame, models, settings: ScoringSettings) -> pl.D
             pred,
             pl.DataFrame(_quantile_cols("fp", fpq) + _quantile_cols("share", shq)),
             q,
-            feats.select("team_now", "age", "fp_pg_1", "share_1", "gp_1", "mpg_1"),
+            feats.select("team_now", "age", "fp_pg_1", "share_1", "gp_1", "mpg_1", "fp_pg_w", "share_w"),
         ],
         how="horizontal",
     ).with_columns(pl.lit(False).alias("rookie"), pl.lit(q_lg).alias("q_league"))
@@ -73,6 +73,8 @@ def rookie_projections(
         pl.lit(None, dtype=pl.Float64).alias("share_1"),
         pl.lit(None, dtype=pl.Float64).alias("gp_1"),
         pl.lit(None, dtype=pl.Float64).alias("mpg_1"),
+        pl.lit(None, dtype=pl.Float64).alias("fp_pg_w"),
+        pl.lit(None, dtype=pl.Float64).alias("share_w"),
         pl.lit(True).alias("rookie"),
         pl.lit(q_league).alias("q_league"),
         pl.col("donor_ids"),

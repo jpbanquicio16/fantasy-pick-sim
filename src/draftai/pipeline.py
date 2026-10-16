@@ -172,3 +172,45 @@ def load_board(paths: Paths, season: int) -> Board:
     if not (d / "board.parquet").exists():
         raise FileNotFoundError(f"no board for {season}; run `draftai project` first")
     return Board.load(d)
+
+
+# --- opponents (V4) -----------------------------------------------------------------
+def opponents_dir(paths: Paths) -> Path:
+    return paths.artifacts / "opponents"
+
+
+def live_opponents(ctx: LeagueContext, board: Board, sim: SimConfig, paths: Paths, log=print):
+    """The opponent model for a live draft or a mock on this board.
+
+    beta(t) is calibrated so simulated drafts reproduce the configured ADP spread (the same
+    spread the survival odds use; fit it from your drafts with `draftai adp --username`).
+    The need weight comes from the model fitted on your real drafts (`draftai opponents`)
+    when there is one. Its off-board share is not carried over: it was measured against
+    the backtest's proxy market, so it mixes drafter noise with proxy error. Cached per
+    league shape and board.
+    """
+    import hashlib
+
+    from draftai.draft.needs import NeedModel
+    from draftai.draft.opponents import Market, OpponentModel, calibrate
+    from draftai.draft.order import pick_owners
+
+    hist = opponents_dir(paths) / "history.json"
+    fitted = OpponentModel.load(hist) if hist.exists() else None
+    adp_hash = hashlib.sha256(board.players["adp"].to_numpy().tobytes()).hexdigest()[:10]
+    key = (f"{ctx.teams}_{ctx.rounds}_{ctx.draft_type}_{ctx.reversal_round}_{sim.adp_sigma_a}_{sim.adp_sigma_b}_"
+           f"{sim.opponent_window}_{adp_hash}_{fitted.gamma if fitted else 0.8:.4f}")
+    path = opponents_dir(paths) / f"live_{ctx.teams}t.json"
+    if path.exists():
+        m = OpponentModel.load(path)
+        if m.diagnostics.get("key") == key:
+            return m
+    log("calibrating the opponent model to this board (once per board)...")
+    needs = NeedModel(board.positions(), board.slots)
+    owners = pick_owners(ctx.teams, ctx.rounds, ctx.draft_type, ctx.reversal_round, ctx.traded)
+    m = calibrate(Market(board.players["adp"].to_numpy(), needs), owners, sim.adp_sigma_a, sim.adp_sigma_b,
+                  gamma=fitted.gamma if fitted else 0.8, window=sim.opponent_window)
+    m.diagnostics["key"] = key
+    m.diagnostics["need_weight_from"] = "fitted on your drafts" if fitted else "default"
+    m.save(path)
+    return m

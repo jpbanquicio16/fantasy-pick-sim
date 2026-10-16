@@ -12,7 +12,17 @@ from datetime import date, timedelta
 import numpy as np
 import polars as pl
 
+from draftai.config import TrainConfig
+from draftai.scoring import ScoringSettings
+
 STATS = ("pts", "reb", "ast", "stl", "blk", "tov", "fg3m")
+S = ScoringSettings()
+CFG = TrainConfig(
+    first_target_season=2018, validation_seasons=[2020, 2021], test_season=2022, target_season=2023,
+    lgbm={"n_estimators": 30, "learning_rate": 0.1, "num_leaves": 7, "max_depth": 3, "min_child_samples": 10,
+          "verbose": -1},
+)
+ROSTER = ["PG", "SG", "G", "SF", "PF", "F", "C", "C", "UTIL", "UTIL", "BN", "BN", "BN", "IL"]
 
 
 def make_league(seasons=range(2016, 2023), teams: int = 10, per_team: int = 12, games: int = 40,

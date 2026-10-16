@@ -8,3 +8,9 @@ candidate_pool: 40       # players scored exactly at each pick
 shortlist: 12            # players given the pairwise next-pick lookahead
 risk_lambda: 0.0         # penalty per SD of season value (0 = risk neutral)
 poll_seconds: 3.0
+# V4: Monte Carlo rollouts and opponents
+rollout_worlds: 600      # simulated drafts + seasons per candidate
+rollout_shortlist: 8     # candidates from the greedy recommender given rollouts
+rollout_race_after: 200  # worlds before clearly-behind candidates are dropped
+waiver_slots: 1          # waiver claims a simulated roster can start in a week
+opponent_window: 50      # opponents choose among the first N available by ADP

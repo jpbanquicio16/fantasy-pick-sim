@@ -60,3 +60,42 @@ def season_value(weekly: np.ndarray, elig: np.ndarray, weights: np.ndarray) -> f
         v, _ = optimise(weekly[:, k], elig)
         total += weights[k] * v
     return total
+
+
+def slot_specificity(slots: Sequence[str]) -> np.ndarray:
+    """How many positions each slot accepts (PG: 1, G: 3, UTIL: 7); fewer is more specific."""
+    return np.array([len(SLOT_ELIGIBILITY.get(s, {s})) for s in slots], dtype=float)
+
+
+def greedy_lineups(values: np.ndarray, elig: np.ndarray, specificity: np.ndarray) -> np.ndarray:
+    """Lineup value for many rosters and weeks at once: (m, players, weeks) -> (m, weeks).
+
+    Players are placed in descending value, each into the most specific open slot he is
+    eligible for; between equally specific slots, the one fewer of the remaining players
+    can fill. With flex slots (G, F, UTIL) this is within about half a percent of the exact
+    assignment (tests/unit/test_season.py), and it vectorises across simulated worlds where
+    ``optimise`` needs one solver call per roster-week. Values <= 0 are never started.
+    ``elig`` is (m, players, slots).
+    """
+    m, n, k = values.shape
+    s = elig.shape[2]
+    order = np.argsort(-values, axis=1)
+    open_ = np.ones((m, k, s), dtype=bool)
+    total = np.zeros((m, k))
+    mi = np.arange(m)[:, None]
+    positive = (values > 0)[..., None] & elig[:, :, None, :]  # (m, n, k, s)
+    demand = positive.sum(axis=1).astype(float)  # (m, k, s) players who could still use each slot
+    tiebreak = np.arange(s) * 1e-6  # then the earlier slot
+    for r in range(n):
+        idx = order[:, r, :]  # (m, k)
+        v = np.take_along_axis(values, idx[:, None, :], axis=1)[:, 0, :]
+        e = elig[mi, idx]  # (m, k, s)
+        demand -= e & (v > 0)[..., None]
+        cand = e & open_ & (v > 0)[..., None]
+        score = np.where(cand, specificity * 1e3 + demand + tiebreak, np.inf)
+        best = score.argmin(axis=2)
+        ok = np.isfinite(score.min(axis=2))
+        total += np.where(ok, v, 0.0)
+        a, b = np.nonzero(ok)
+        open_[a, b, best[a, b]] = False
+    return total

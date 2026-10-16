@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "draftai"
-version = "0.3.0"
+version = "0.4.0"
 description = "Probabilistic draft assistant for Sleeper Lock-In fantasy basketball"
 readme = "README.md"
 requires-python = ">=3.11"

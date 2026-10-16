@@ -9,7 +9,7 @@ from datetime import date
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -74,6 +74,12 @@ class LeagueConfig(BaseModel):
     )
     scoring_settings: dict[str, float] | None = None
 
+    @field_validator("league_id", "draft_id", "username", mode="before")
+    @classmethod
+    def _as_string(cls, v):
+        """Sleeper ids are numeric strings; unquoted in YAML they arrive as ints."""
+        return None if v is None else str(v)
+
 
 class TrainConfig(BaseModel):
     ingest_seasons: list[int] = Field(default_factory=lambda: list(range(2013, 2026)))
@@ -112,6 +118,33 @@ class SimConfig(BaseModel):
     shortlist: int = 12
     risk_lambda: float = 0.0
     poll_seconds: float = 3.0
+    # V4: Monte Carlo rollouts and the opponent model.
+    rollout_worlds: int = 600
+    rollout_shortlist: int = 8
+    rollout_race_after: int = 200
+    waiver_slots: int = 1  # waiver claims a simulated roster can start in a week
+    opponent_window: int = 50
+
+
+class BacktestConfig(BaseModel):
+    seasons: list[int] = Field(default_factory=lambda: [2021, 2022, 2023, 2024, 2025])
+    strategies: list[str] = Field(
+        default_factory=lambda: ["adp", "points", "vor", "greedy_survival", "rollout", "oracle"])
+    leagues: int = 96  # simulated leagues per season (your seat rotates through every slot)
+    expensive_leagues: int = 24  # leagues that also run greedy_survival and rollout
+    schedules: int = 40  # head-to-head schedules averaged per league
+    waiver_claims: int = 2
+    rollout_worlds: int = 300
+    rollout_shortlist: int = 6
+    rollout_race_after: int = 150
+    game_samples: int = 2000
+    seed: int = 5
+    jobs: int = 5
+    replay_schedules: int = 200
+    # Simulated rooms: "calibrated" drafts around the market with the configured ADP spread;
+    # "fitted" uses the model fitted on your real drafts (noisier: it reads informed
+    # deviations from the proxy market as noise, so its teams are weaker than real ones).
+    room: str = "calibrated"
 
 
 def _load_yaml(path: Path) -> dict:
@@ -146,3 +179,7 @@ def season_label(season: int) -> str:
 def season_of(d: date) -> int:
     """NBA season (start year) that a date belongs to; the season turns over on 1 August."""
     return d.year if d.month >= 8 else d.year - 1
+
+
+def load_backtest_config(path: Path | None = None) -> BacktestConfig:
+    return BacktestConfig(**_load_yaml(path or Paths().configs / "backtest.yaml"))

@@ -66,8 +66,101 @@ FP/G as a predictor of the realised locked score (MAE 6.46 vs 7.16). It is close
 unbiased when the player plays every game in the week (+0.36) and optimistic in weeks with
 a mid-week absence (+6.8), because availability is modelled week by week.
 
-## Not yet validated against the market
+## Opponent model (V4)
 
-The design's market tests (Spearman against ADP's, regression of realised value on ADP and
-projection together, draft-level P(top 6) against ADP drafting) need historical ADP
-snapshots dated before each draft. They are scoped for V4.
+Each opponent pick is a conditional logit over the available players:
+`u = -beta(t) * (market rank among available - 1) + gamma * fills an open starting slot`,
+`beta(t) = exp(c0) * t^c1`, mixed with a small share of off-board picks (uniform over the
+available players). Fitted by maximum likelihood on real Sleeper drafts (`draftai opponents`;
+your own picks excluded) and scored on held-out teams.
+
+- On the one real draft available (LeFantasy 2025, 126 opponent picks) the off-board share is
+  about 6.5% and improves held-out log-likelihood per pick from -4.75 to -4.39 (uniform: -6.53;
+  constant beta: -4.43).
+  These include keeper and IL stashes: that league keeps one player and has five IL slots.
+- The need term is not identified by these drafts: with G, F and two UTIL slots almost any
+  player fills an open slot until a lineup is full, after which none does, so need never varied
+  among the available players at any real pick. The prior (gamma = 0.8) is kept.
+- Live drafts and mocks use beta(t) calibrated so simulated drafts reproduce the configured ADP
+  spread (sigma = 1.5 + 0.12 ADP; the same spread the survival odds use). The fitted model's
+  beta and off-board share were measured against the backtest's proxy market, so they mix
+  drafter noise with proxy error and are not carried over.
+
+## Monte Carlo rollouts (V4)
+
+For each of the greedy recommender's top 8 candidates, 600 simulated worlds: every player's
+season drawn from the calibrated FP/G and games-share quantiles (absences as one block of
+weeks), the rest of the draft simulated with the opponent model and a greedy base policy for
+your later picks (highest VOR that fills an open starting slot), and the final roster scored
+week by week (best lineup; one waiver claim). Common random numbers across candidates; racing
+drops candidates whose paired difference to the leader is clearly negative after 200 worlds.
+Confidence is P(A's roster beats B's) over the shared worlds. About 1-2 s per pick on a laptop.
+
+Weekly lineups inside the rollouts use a vectorised greedy fill (most specific open slot first);
+on real-board rosters it reaches 99.8% of the exact assignment's value (worst roster seen: 92.6%).
+
+## Draft backtest (V4)
+
+Five seasons (2021-22 to 2025-26), your league's shape (12 teams, 14 rounds, third-round
+reversal, one C slot, top 6 make the playoffs). Each season: 96 simulated leagues with your seat
+rotated through every slot (the greedy recommender and the rollouts on 24 of them, 120 in all),
+opponents drafting around the market with the configured ADP spread, then the real season played
+under Lock-In rules. Paired: same leagues, seat, opponent random numbers and schedules.
+
+| Strategy | P(top 6) | P(title) | Realised FP/week |
+|---|---|---|---|
+| Hindsight oracle (ceiling) | 1.000 | 0.848 | 261.4 |
+| **Rollouts (V4)** | **0.931** | **0.315** | **240.1** |
+| Greedy value + survival (V3) | 0.926 | 0.258 | 236.2 |
+| Greedy VOR (= projected points here) | 0.881 | 0.263 | 234.9 |
+| Draft by market ADP | 0.753 | 0.187 | 229.9 |
+
+Paired differences over the 120 shared leagues (95% bootstrap interval):
+
+| Rollouts vs | P(top 6) | FP/week | P(title) |
+|---|---|---|---|
+| Market ADP | +0.122 (+0.069, +0.180) | +8.4 (+5.9, +11.0) | +0.100 (+0.028, +0.173) |
+| Greedy VOR | +0.034 (-0.004, +0.074) | +4.7 (+2.7, +6.6) | +0.044 (-0.020, +0.116) |
+
+**Gate (design section 25): not passed.** The rollouts beat market ADP clearly, and beat greedy
+VOR in four of five seasons on P(top 6), but the pooled interval against VOR touches zero, and
+2023-24 went the other way (-0.075). On points the rollouts beat greedy VOR in all five
+seasons (+0.2 to +11.7 FP/week). A run before a small change to the lineup evaluator passed
+narrowly (+0.044, interval +0.005 to +0.084): the result is borderline, and more leagues
+(`--expensive-leagues`) would settle it. P(top 6) is close to saturated for every model-based
+strategy, which is part of why it separates them poorly.
+
+**Confidence is roughly calibrated.** Re-scoring each rollout decision's two branches with the
+real season: decisions shown at 60-70% were right 61% of the time (162 decisions), at 70-80%
+75% (20); at 50-60% the recommendation won 46% (1,498): close calls really are coin flips.
+
+**Market tests (against the proxy market).** The projection ranks realised season value better
+than the market in every season (Spearman 0.58-0.70 vs 0.51-0.63), and in a regression on both,
+its coefficient's interval is above zero every season.
+
+**Your real 2025 LeFantasy draft, replayed.** Keeping every human pick and handing one seat at a
+time to the rollouts, the rollout team out-scored the person who held that seat in all 10 seats,
+by 21.3 FP/week on average. In your seat (slot 9) it scored 247.4 FP/week against your team's
+229.2. Treat this as an upper bound: the league keeps a player and has five IL slots, so humans
+spent picks on stashes (Haliburton went 16th) that a one-season replay scores as zeros.
+
+The market in these simulations is a naive proxy (historical ADP does not exist), so gains
+against `adp` overstate gains against a real room. Full tables, caveats and per-season results:
+`data/artifacts/reports/backtest_report.md` (regenerated by `draftai backtest`, about 15 minutes).
+
+## Limits of the backtest
+
+- **Market.** Historical ADP is not available, so simulated rooms draft around a naive proxy
+  (last season's FP/G; rookies from the draft-slot projection; pre-season news half-priced).
+  It correlates 0.73 with the real 2025 LeFantasy pick order. Real ADP is sharper, so gains
+  against `adp` overstate gains against a real room.
+- **Pre-season news** for past seasons comes from a short hand-maintained file
+  (`configs/backtest_news.csv`), not from dated Sleeper injury reports.
+- **Blend weights and conformal corrections** were chosen on the 2021-22 to 2024-25 validation
+  seasons, so those backtest seasons carry a mild hyperparameter look-ahead. 2025-26 is clean.
+- **Season play** uses one rule for every team: weekly lineups from in-season expectations,
+  per-player lock thresholds (no moving a bench player into a passed slot), waiver claims only
+  for empty starting slots, no trades. One realised season per year: decisions within a season
+  share their outcome.
+- **Replays of real drafts** score one season of a keeper league with IL slots as a redraft,
+  which penalises the humans' stash picks.

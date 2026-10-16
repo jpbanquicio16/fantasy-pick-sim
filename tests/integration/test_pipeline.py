@@ -6,58 +6,15 @@ from datetime import date
 
 import numpy as np
 import polars as pl
-import pytest
+from synthetic import CFG, S
 
-from draftai.config import SimConfig, TrainConfig
+from draftai.config import SimConfig
 from draftai.draft.recommender import RosterEvaluator, expected_best, recommend
 from draftai.draft.state import DraftState
-from draftai.features.build import build_training_set
 from draftai.models.artifacts import load_models, save_models
 from draftai.models.components import ProjectionModel
-from draftai.models.project import season_projections
-from draftai.models.train import train_all
-from draftai.scoring import ScoringSettings
-from draftai.value.board import Board, build_board
+from draftai.value.board import Board
 from draftai.value.replacement import replacement_levels
-from draftai.value.schedule import add_weeks, week_plan
-from synthetic import target_schedule
-
-S = ScoringSettings()
-CFG = TrainConfig(
-    first_target_season=2018, validation_seasons=[2020, 2021], test_season=2022, target_season=2023,
-    lgbm={"n_estimators": 30, "learning_rate": 0.1, "num_leaves": 7, "max_depth": 3, "min_child_samples": 10,
-          "verbose": -1},
-)
-ROSTER = ["PG", "SG", "G", "SF", "PF", "F", "C", "C", "UTIL", "UTIL", "BN", "BN", "BN", "IL"]
-
-
-@pytest.fixture(scope="module")
-def training(league):
-    ts = build_training_set(league["player_games"], league["team_games"], league["bio"], league["draft"], S,
-                            list(range(2018, 2023)))
-    return ts, train_all(ts, S, CFG, log=lambda *_: None)
-
-
-@pytest.fixture(scope="module")
-def board(league, training):
-    _, r = training
-    roster = pl.DataFrame({"player_id": list(league["current"]), "team": list(league["current"].values())})
-    proj = season_projections(league["player_games"], league["team_games"], league["bio"], league["draft"],
-                              r.models_final, S, 2023, date(2023, 10, 19), roster, pool=roster.select("player_id"))
-    proj = proj.with_columns(
-        pl.col("player_id").cast(pl.Utf8).alias("sleeper_id"),
-        pl.format("Player {}", pl.col("player_id")).alias("name"),
-        pl.col("player_id").replace_strict(league["positions"], return_dtype=pl.List(pl.Utf8)).alias("positions"),
-        pl.lit(None, dtype=pl.Utf8).alias("injury_status"),
-    )
-    sched = add_weeks(target_schedule())
-    plan = week_plan(sched, playoff_start=6, playoff_teams=4, playoff_weight=1.5)
-    hist = league["player_games"]
-    b = build_board(proj, hist, sched, plan, S, ROSTER, teams=8, b2b_mult=1.2, target_season=2023, game_samples=1500)
-    rng = np.random.default_rng(0)
-    adp = (-b.players["season_value"].to_numpy() + rng.normal(0, 40, b.players.height)).argsort().argsort() + 1
-    b.players = b.players.with_columns(pl.Series("adp", adp.astype(float)))
-    return b
 
 
 def test_training_reports_every_model(training):

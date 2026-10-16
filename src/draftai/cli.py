@@ -6,7 +6,10 @@
     draftai project             project the draft season and build the board
     draftai lockin-experiment   the Lock-In headline experiment on the test season
     draftai adp                 show or refresh ADP (search rank, CSV, or your Sleeper drafts)
-    draftai recommend           recommendation for a live draft, or an offline mock
+    draftai recommend           recommendation for a live draft, or an offline position
+    draftai mock                offline mock draft; the other teams draft themselves
+    draftai opponents           fit the opponent model on your real Sleeper drafts
+    draftai backtest            paired draft backtest on past seasons, plus real-draft replays
     draftai app                 launch the Streamlit draft assistant
 """
 
@@ -15,6 +18,7 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
+import time
 from datetime import date
 from pathlib import Path
 
@@ -124,6 +128,14 @@ def cmd_adp(args) -> None:
         print(board.players.sort("adp").select("adp", "name", "team_now", "positions", "adp_source").head(args.top))
 
 
+def _rollout_engine(ctx, board, sim, ev, paths):
+    from draftai import pipeline
+    from draftai.draft.rollout import RolloutConfig, RolloutEngine
+
+    model = pipeline.live_opponents(ctx, board, sim, paths)
+    return RolloutEngine(board, model, RolloutConfig.from_sim(sim), sim, evaluator=ev)
+
+
 def cmd_recommend(args) -> None:
     from draftai import pipeline
     from draftai.draft.explain import card, render
@@ -137,6 +149,7 @@ def cmd_recommend(args) -> None:
     board = pipeline.load_board(paths, ctx.season)
     ev = RosterEvaluator(board)
     names = dict(zip(board.players["sleeper_id"].to_list(), board.players["name"].to_list()))
+    engine = _rollout_engine(ctx, board, sim, ev, paths) if args.rollout else None
 
     def show(state):
         if state.complete:
@@ -145,8 +158,14 @@ def cmd_recommend(args) -> None:
         rec = recommend(board, state, sim, ev)
         until = state.picks_until_mine()
         print(f"\n--- pick {state.current_pick} | your next pick {state.my_upcoming()[:1]} | {until} picks away ---")
-        print(render(card(rec, board.players, ctx.scoring)))
-        print(rec.table().head(args.top).select("rank", "player", "pos", "adp", "reach", "survival", "delta_per_week"))
+        ro = engine.recommend(state, rec) if engine is not None else None
+        print(render(card(rec, board.players, ctx.scoring, rollout=ro)))
+        if ro is not None:
+            print(ro.table().head(args.top).select("rank", "player", "pos", "value_per_week", "gap_per_week", "p_best",
+                                                   "reach", "survival_sim", "dropped"))
+            print(f"({ro.worlds} worlds, {ro.elapsed:.1f} s)")
+        else:
+            print(rec.table().head(args.top).select("rank", "player", "pos", "adp", "reach", "survival", "delta_per_week"))
 
     if ctx.draft_id:
         live = LiveDraft(ctx, SleeperClient())
@@ -162,6 +181,162 @@ def cmd_recommend(args) -> None:
     for token in args.picks or []:
         state.add_pick(by_name.get(token.lower(), token))
     show(state)
+
+
+def cmd_mock(args) -> None:
+    """Offline mock in the terminal: the other teams draft themselves with the opponent model."""
+    import polars as pl
+
+    from draftai import pipeline
+    from draftai.draft.explain import card, render
+    from draftai.draft.mock import MockDraft
+    from draftai.draft.recommender import RosterEvaluator, recommend
+
+    paths = Paths()
+    ctx = _ctx(args)
+    if args.slot:
+        ctx.my_slot = args.slot
+    sim = load_sim_config()
+    board = pipeline.load_board(paths, ctx.season)
+    ev = RosterEvaluator(board)
+    model = pipeline.live_opponents(ctx, board, sim, paths)
+    engine = _rollout_engine(ctx, board, sim, ev, paths) if args.rollout else None
+    mock = MockDraft(ctx, board, model, **({"seed": args.seed} if args.seed is not None else {}))
+    print(f"Mock draft: {ctx.teams} teams, {ctx.rounds} rounds, {ctx.draft_type}"
+          + (f" (reversal from round {ctx.reversal_round})" if ctx.reversal_round else "")
+          + f"; you pick from slot {ctx.my_slot}; seed {mock.seed}. {model.describe()}")
+    by_name = {n.lower(): s for s, n in zip(board.players["sleeper_id"].to_list(), board.players["name"].to_list())}
+
+    def best(state) -> str:
+        rec = recommend(board, state, sim, ev)
+        if engine is not None:
+            return engine.recommend(state, rec).best.sleeper_id
+        return rec.best.sleeper_id
+
+    auto = args.auto
+    while not mock.state.complete:
+        for mp in mock.advance():
+            if not args.quiet:
+                print(f"  {mp.pick:>3}. {mock.team_name(mp.slot):<10} {mp.name} ({'/'.join(mp.positions)}, ADP {mp.adp:.0f})")
+        if mock.state.complete:
+            break
+        if auto:
+            mp = mock.pick(best(mock.state), by="engine")
+            print(f"  {mp.pick:>3}. {'You':<10} {mp.name} ({'/'.join(mp.positions)}, ADP {mp.adp:.0f})  <- engine")
+            continue
+        rec = recommend(board, mock.state, sim, ev)
+        ro = engine.recommend(mock.state, rec) if engine is not None else None
+        print()
+        print(render(card(rec, board.players, ctx.scoring, rollout=ro)))
+        top = (ro.table().select("rank", "player", "pos", "gap_per_week", "p_best") if ro is not None
+               else rec.table().select("rank", "player", "pos", "adp", "survival", "delta_per_week"))
+        print(top.head(args.top))
+        choice = input("Your pick [Enter = #1, number = that rank, name, 'auto' = engine drafts the rest, 'q' = quit]: ").strip()
+        if choice.lower() in ("q", "quit"):
+            return
+        if choice.lower() == "auto":
+            auto = True
+            continue
+        ranked = [c.sleeper_id for c in (ro.candidates if ro is not None else rec.candidates)]
+        if not choice:
+            sid = ranked[0]
+        elif choice.isdigit() and 1 <= int(choice) <= len(ranked):
+            sid = ranked[int(choice) - 1]
+        else:
+            sid = by_name.get(choice.lower()) or next((s for n, s in by_name.items() if choice.lower() in n), None)
+            if sid is None or sid in mock.state.drafted:
+                print("Not an available player; try again.")
+                continue
+        mp = mock.pick(sid)
+        print(f"  {mp.pick:>3}. You        {mp.name}")
+    names = dict(zip(board.players["sleeper_id"].to_list(), board.players["name"].to_list()))
+    print("\nYour roster:", ", ".join(names.get(p, p) for p in mock.state.roster()))
+    with pl.Config(tbl_rows=40):
+        print(mock.projection(ev, n_worlds=sim.rollout_worlds // 2, waiver_slots=sim.waiver_slots))
+    print("Projected by this model, against opponents who draft around ADP: it flatters the engine's own team.")
+
+
+def cmd_opponents(args) -> None:
+    from draftai import pipeline
+    from draftai.backtest.replay import fit_opponents, load_real_drafts
+    from draftai.config import load_backtest_config
+    from draftai.ingestion.sleeper import SleeperClient
+
+    paths = Paths().ensure()
+    ctx = _ctx(args)
+    cfg = load_league_config(Path(args.config) if args.config else None)
+    username = args.username or cfg.username
+    bt = load_backtest_config()
+    seasons = args.seasons or bt.seasons
+    if not username:
+        raise SystemExit("set username in configs/league.yaml or pass --username")
+    drafts = [d for d in load_real_drafts(SleeperClient(), username, seasons) if d.season < ctx.season]
+    sim = load_sim_config()
+    if drafts:
+        model = fit_opponents(drafts, sim, load_train_config(), paths, bt.game_samples)
+        model.save(pipeline.opponents_dir(paths) / "history.json")
+        print(model.describe())
+        import json
+
+        print(json.dumps(model.diagnostics, indent=2))
+    else:
+        print(f"no completed drafts of {username} in {seasons}; live opponents use the calibrated defaults")
+    board = pipeline.load_board(paths, ctx.season)
+    live = pipeline.live_opponents(ctx, board, sim, paths)
+    print("live:", live.describe())
+    print("live calibration:", {k: v for k, v in live.diagnostics.items() if k != "key"})
+
+
+def cmd_backtest(args) -> None:
+    from draftai.backtest import replay as rp
+    from draftai.backtest.history import LeagueRules
+    from draftai.backtest.run import gate, run, summary, write_report
+    from draftai.config import load_backtest_config
+    from draftai.ingestion.sleeper import SleeperClient
+
+    paths = Paths().ensure()
+    ctx = _ctx(args)
+    bt = load_backtest_config()
+    for k in ("seasons", "leagues", "expensive_leagues", "strategies", "jobs"):
+        if getattr(args, k, None) is not None:
+            setattr(bt, k, getattr(args, k))
+    if args.quick:
+        bt.leagues, bt.expensive_leagues, bt.schedules, bt.rollout_worlds = 24, 6, 20, 200
+    rules = LeagueRules.from_ctx(ctx)
+    sim, train_cfg = load_sim_config(), load_train_config()
+    t0 = time.time()
+    res = run(rules, sim, train_cfg, bt, paths)
+    cfg = load_league_config(Path(args.config) if args.config else None)
+    username = args.username or cfg.username
+    if not args.no_replay and username:
+        from draftai.backtest.run import opponent_model
+
+        drafts = [d for d in rp.load_real_drafts(SleeperClient(), username, bt.seasons) if d.season < ctx.season]
+        frames = []
+        for d in drafts:
+            from draftai.backtest.history import season_data
+
+            sd = season_data(d.season, d.rules, sim, train_cfg, paths, bt.game_samples)
+            # Substitute picks imitate this real room, so they use the fitted model when there is one.
+            model = opponent_model(sd.board, d.rules, sim, paths, room="fitted")
+            names = [s for s in bt.strategies if s != "points"]
+            frames.append(rp.replay(d, sim, train_cfg, bt, paths, model, names))
+        if frames:
+            import polars as pl
+
+            res.replay = pl.concat(frames)
+            res.replay_meta = {"drafts": [d.label for d in drafts],
+                               "unmatched": int(res.replay["unmatched_picks"].max())}
+    report = write_report(res, rules, bt, paths.artifacts / "reports")
+    import polars as pl
+
+    with pl.Config(tbl_rows=20, tbl_width_chars=160):
+        print(summary(res.rows))
+        if res.replay is not None:
+            print(rp.summarise(res.replay))
+    g = gate(res.rows)
+    print(f"\nV4 gate (rollout beats ADP and VOR on P(top {rules.playoff_teams})): {'PASS' if g.get('passed') else 'FAIL'}")
+    print(f"report: {report}  ({time.time() - t0:.0f} s)")
 
 
 def cmd_app(args) -> None:
@@ -214,8 +389,35 @@ def main(argv: list[str] | None = None) -> None:
     league_args(p)
     p.add_argument("--follow", action="store_true", help="poll a live draft and update after every pick")
     p.add_argument("--picks", nargs="*", help="offline: picks so far, in order (Sleeper ids or exact names)")
+    p.add_argument("--rollout", action="store_true", help="Monte Carlo rollouts with confidence (V4)")
     p.add_argument("--top", type=int, default=8)
     p.set_defaults(fn=cmd_recommend)
+
+    p = sub.add_parser("mock", help="offline mock draft; the other teams draft themselves")
+    league_args(p)
+    p.add_argument("--auto", action="store_true", help="the engine drafts for you too")
+    p.add_argument("--rollout", action="store_true", help="use Monte Carlo rollouts for your picks")
+    p.add_argument("--seed", type=int, help="replay a mock room")
+    p.add_argument("--quiet", action="store_true", help="do not print the other teams' picks")
+    p.add_argument("--top", type=int, default=6)
+    p.set_defaults(fn=cmd_mock)
+
+    p = sub.add_parser("opponents", help="fit the opponent model on your real Sleeper drafts")
+    league_args(p)
+    p.add_argument("--seasons", type=int, nargs="*")
+    p.set_defaults(fn=cmd_opponents)
+
+    p = sub.add_parser("backtest", help="paired draft backtest on past seasons (slow: minutes)")
+    league_args(p)
+    p.add_argument("--seasons", type=int, nargs="*")
+    p.add_argument("--leagues", type=int, help="simulated leagues per season")
+    p.add_argument("--expensive-leagues", dest="expensive_leagues", type=int,
+                   help="leagues that also run greedy_survival and rollout")
+    p.add_argument("--strategies", nargs="*")
+    p.add_argument("--jobs", type=int)
+    p.add_argument("--quick", action="store_true", help="small run for a smoke test")
+    p.add_argument("--no-replay", action="store_true", help="skip replays of your real drafts")
+    p.set_defaults(fn=cmd_backtest)
 
     p = sub.add_parser("app", help="launch the Streamlit app")
     p.add_argument("streamlit_args", nargs="*")
