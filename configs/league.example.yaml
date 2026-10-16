@@ -1,0 +1,21 @@
+# Copy to configs/league.yaml (git-ignored) and fill in your league.
+# Anything the Sleeper API provides (roster positions, scoring, teams, rounds,
+# draft order, playoff start) is read from the API at runtime when league_id is set;
+# the values below are offline fallbacks only.
+season: 2026            # 2026-27
+league_id: null         # e.g. "1180000000000000000"
+draft_id: null          # optional; defaults to the league's draft
+username: null          # your Sleeper username (to find your slot)
+draft_slot: 2           # used when no live draft is connected
+bonus_stacking: null    # null = Sleeper default (verified: 40+ and 50+ bonuses stack)
+playoff_weight: 1.5     # weight w on fantasy-playoff weeks
+include_cup_final: false
+
+teams: 12
+rounds: 13
+draft_type: snake
+reversal_round: 0       # 3 for third-round reversal
+playoff_week_start: 22
+playoff_teams: 6
+roster_positions: [PG, SG, G, SF, PF, F, C, C, UTIL, UTIL, BN, BN, BN, IL]
+scoring_settings: null  # null = Sleeper default basketball scoring

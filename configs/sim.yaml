@@ -1,0 +1,10 @@
+seed: 11
+game_samples: 4000       # simulated games per player for Lock-In values
+min_donor_games: 40      # borrow games from similar players below this many
+donor_neighbours: 8
+adp_sigma_a: 1.5         # draft-position spread: sigma = a + b * ADP
+adp_sigma_b: 0.12
+candidate_pool: 40       # players scored exactly at each pick
+shortlist: 12            # players given the pairwise next-pick lookahead
+risk_lambda: 0.0         # penalty per SD of season value (0 = risk neutral)
+poll_seconds: 3.0
