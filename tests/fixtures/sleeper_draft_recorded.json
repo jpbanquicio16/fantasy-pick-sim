@@ -1,0 +1,283 @@
+{
+ "note": "Recorded shape of Sleeper's league, draft, picks and traded_picks responses for a 4-team, 3-round draft with third-round reversal and one traded pick.",
+ "league": {
+  "league_id": "L1",
+  "name": "Test League",
+  "season": "2026",
+  "sport": "nba",
+  "status": "drafting",
+  "total_rosters": 4,
+  "draft_id": "D1",
+  "roster_positions": [
+   "PG",
+   "SG",
+   "G",
+   "SF",
+   "PF",
+   "F",
+   "C",
+   "C",
+   "UTIL",
+   "UTIL",
+   "BN",
+   "BN",
+   "BN",
+   "IL"
+  ],
+  "scoring_settings": {
+   "pts": 0.5,
+   "reb": 1.0,
+   "ast": 1.0,
+   "stl": 2.0,
+   "blk": 2.0,
+   "to": -1.0,
+   "tpm": 0.5,
+   "dd": 1.0,
+   "td": 2.0,
+   "bonus_pt_40p": 2.0,
+   "bonus_pt_50p": 2.0,
+   "tf": -2.0,
+   "ff": -2.0
+  },
+  "settings": {
+   "playoff_week_start": 22,
+   "playoff_teams": 6,
+   "playoff_round_type": 0,
+   "num_teams": 4
+  }
+ },
+ "draft": {
+  "draft_id": "D1",
+  "league_id": "L1",
+  "season": "2026",
+  "status": "drafting",
+  "type": "snake",
+  "settings": {
+   "teams": 4,
+   "rounds": 3,
+   "reversal_round": 3,
+   "pick_timer": 90
+  },
+  "draft_order": {
+   "u1": 1,
+   "u2": 2,
+   "u3": 3,
+   "u4": 4
+  },
+  "slot_to_roster_id": {
+   "1": 1,
+   "2": 2,
+   "3": 3,
+   "4": 4
+  }
+ },
+ "picks": [
+  {
+   "pick_no": 1,
+   "round": 1,
+   "draft_slot": 1,
+   "player_id": "p1",
+   "picked_by": "u1",
+   "roster_id": 1,
+   "is_keeper": null,
+   "metadata": {
+    "first_name": "Player",
+    "last_name": "1",
+    "position": "PG",
+    "team": "AAA"
+   }
+  },
+  {
+   "pick_no": 2,
+   "round": 1,
+   "draft_slot": 2,
+   "player_id": "p2",
+   "picked_by": "u2",
+   "roster_id": 2,
+   "is_keeper": null,
+   "metadata": {
+    "first_name": "Player",
+    "last_name": "2",
+    "position": "PG",
+    "team": "AAA"
+   }
+  },
+  {
+   "pick_no": 3,
+   "round": 1,
+   "draft_slot": 3,
+   "player_id": "p3",
+   "picked_by": "u3",
+   "roster_id": 3,
+   "is_keeper": null,
+   "metadata": {
+    "first_name": "Player",
+    "last_name": "3",
+    "position": "PG",
+    "team": "AAA"
+   }
+  },
+  {
+   "pick_no": 4,
+   "round": 1,
+   "draft_slot": 4,
+   "player_id": "p4",
+   "picked_by": "u4",
+   "roster_id": 4,
+   "is_keeper": null,
+   "metadata": {
+    "first_name": "Player",
+    "last_name": "4",
+    "position": "PG",
+    "team": "AAA"
+   }
+  },
+  {
+   "pick_no": 5,
+   "round": 2,
+   "draft_slot": 4,
+   "player_id": "p5",
+   "picked_by": "u4",
+   "roster_id": 4,
+   "is_keeper": null,
+   "metadata": {
+    "first_name": "Player",
+    "last_name": "5",
+    "position": "PG",
+    "team": "AAA"
+   }
+  },
+  {
+   "pick_no": 6,
+   "round": 2,
+   "draft_slot": 3,
+   "player_id": "p6",
+   "picked_by": "u3",
+   "roster_id": 3,
+   "is_keeper": null,
+   "metadata": {
+    "first_name": "Player",
+    "last_name": "6",
+    "position": "PG",
+    "team": "AAA"
+   }
+  },
+  {
+   "pick_no": 7,
+   "round": 2,
+   "draft_slot": 2,
+   "player_id": "p7",
+   "picked_by": "u2",
+   "roster_id": 2,
+   "is_keeper": null,
+   "metadata": {
+    "first_name": "Player",
+    "last_name": "7",
+    "position": "PG",
+    "team": "AAA"
+   }
+  },
+  {
+   "pick_no": 8,
+   "round": 2,
+   "draft_slot": 1,
+   "player_id": "p8",
+   "picked_by": "u1",
+   "roster_id": 1,
+   "is_keeper": null,
+   "metadata": {
+    "first_name": "Player",
+    "last_name": "8",
+    "position": "PG",
+    "team": "AAA"
+   }
+  },
+  {
+   "pick_no": 9,
+   "round": 3,
+   "draft_slot": 4,
+   "player_id": "p9",
+   "picked_by": "u2",
+   "roster_id": 2,
+   "is_keeper": null,
+   "metadata": {
+    "first_name": "Player",
+    "last_name": "9",
+    "position": "PG",
+    "team": "AAA"
+   }
+  },
+  {
+   "pick_no": 10,
+   "round": 3,
+   "draft_slot": 3,
+   "player_id": "p10",
+   "picked_by": "u3",
+   "roster_id": 3,
+   "is_keeper": null,
+   "metadata": {
+    "first_name": "Player",
+    "last_name": "10",
+    "position": "PG",
+    "team": "AAA"
+   }
+  },
+  {
+   "pick_no": 11,
+   "round": 3,
+   "draft_slot": 2,
+   "player_id": "p11",
+   "picked_by": "u2",
+   "roster_id": 2,
+   "is_keeper": null,
+   "metadata": {
+    "first_name": "Player",
+    "last_name": "11",
+    "position": "PG",
+    "team": "AAA"
+   }
+  },
+  {
+   "pick_no": 12,
+   "round": 3,
+   "draft_slot": 1,
+   "player_id": "p12",
+   "picked_by": "u1",
+   "roster_id": 1,
+   "is_keeper": null,
+   "metadata": {
+    "first_name": "Player",
+    "last_name": "12",
+    "position": "PG",
+    "team": "AAA"
+   }
+  }
+ ],
+ "traded_picks": [
+  {
+   "season": "2026",
+   "round": 3,
+   "roster_id": 4,
+   "owner_id": 2,
+   "previous_owner_id": 4
+  }
+ ],
+ "users": [
+  {
+   "user_id": "u1",
+   "display_name": "alpha"
+  },
+  {
+   "user_id": "u2",
+   "display_name": "me"
+  },
+  {
+   "user_id": "u3",
+   "display_name": "gamma"
+  },
+  {
+   "user_id": "u4",
+   "display_name": "delta"
+  }
+ ]
+}
