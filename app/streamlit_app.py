@@ -18,7 +18,7 @@ import streamlit as st
 
 from draftai import pipeline
 from draftai.config import Paths, load_league_config, load_sim_config
-from draftai.draft.explain import card
+from draftai.draft.explain import card, minutes_text, role_text
 from draftai.draft.league import LeagueContext
 from draftai.draft.mock import MockDraft
 from draftai.draft.recommender import RosterEvaluator, recommend
@@ -248,6 +248,49 @@ def mock_results(board, ev) -> None:
         start(ss.ctx, "manual", auto=True)
 
 
+OVERRIDES = Paths().configs / "minutes_overrides.csv"
+
+
+def minutes_overrides_panel(board, ctx: LeagueContext) -> None:
+    """Expected minutes for preseason news the model cannot know. Saved to
+    configs/minutes_overrides.csv; the board is rebuilt (a few seconds) with the change
+    taken from or given to the player's teammates. The model is untouched."""
+    p = board.players
+    by_name = dict(zip(p["name"].to_list(), p["sleeper_id"].to_list()))
+    by_id = {v: k for k, v in by_name.items()}
+    with st.expander("Minutes overrides (preseason news)"):
+        st.caption("A starting job announced, a move to the bench: enter his expected minutes per game. "
+                   "Teammates absorb the change, mostly at his positions.")
+        cur = pl.read_csv(OVERRIDES, schema_overrides={"sleeper_id": pl.Utf8, "mpg": pl.Float64, "note": pl.Utf8}) \
+            if OVERRIDES.exists() else pl.DataFrame(schema={"sleeper_id": pl.Utf8, "mpg": pl.Float64, "note": pl.Utf8})
+        rows = [{"player": by_id.get(sid, sid), "mpg": m, "note": n}
+                for sid, m, n in cur.select("sleeper_id", "mpg", "note").iter_rows()]
+        edited = st.data_editor(
+            rows or [{"player": None, "mpg": None, "note": None}], num_rows="dynamic", hide_index=True, key="mo_edit",
+            column_config={
+                "player": st.column_config.SelectboxColumn("Player", options=sorted(by_name)),
+                "mpg": st.column_config.NumberColumn("Min/game", min_value=0.0, max_value=44.0, step=0.5),
+                "note": st.column_config.TextColumn("Note"),
+            })
+        if st.button("Save and rebuild the board"):
+            keep = [r for r in edited if r.get("player") and r.get("mpg") is not None]
+            out = pl.DataFrame({"sleeper_id": [by_name.get(r["player"], r["player"]) for r in keep],
+                                "name": [r["player"] for r in keep], "mpg": [float(r["mpg"]) for r in keep],
+                                "note": [r.get("note") for r in keep]},
+                               schema={"sleeper_id": pl.Utf8, "name": pl.Utf8, "mpg": pl.Float64, "note": pl.Utf8})
+            out.write_csv(OVERRIDES)
+            with st.spinner("Rebuilding the board..."):
+                adp = p.select([c for c in ("sleeper_id", "adp", "adp_source", "adp_sd") if c in p.columns])
+                pipeline.project(ctx, SIM, Paths(), adp_from=adp, log=lambda *_: None)
+            load_board.clear()
+            rollout_engine.clear()
+            ss.rollout = ss.projection = None
+            st.rerun()
+        changed = p.filter(pl.col("minutes_override")) if "minutes_override" in p.columns else p.head(0)
+        for r in changed.iter_rows(named=True):
+            st.write(f"{r['name']}: {minutes_text(r)}")
+
+
 def main_screen() -> None:
     ctx, state = ss.ctx, ss.state
     try:
@@ -274,6 +317,7 @@ def main_screen() -> None:
         st.toggle("Monte Carlo rollouts (V4)", key="use_rollout",
                   help=f"Simulate {SIM.rollout_worlds} drafts and seasons per candidate when you are within "
                        f"{ROLLOUT_LOOKAHEAD} picks; adds confidence (P(A's roster beats B's)). About 1-2 s.")
+        minutes_overrides_panel(board, ctx)
         if st.button("Disconnect"):
             ss.ctx = ss.state = ss.mode = ss.mock = ss.rollout = ss.projection = None
             st.rerun()
@@ -338,6 +382,10 @@ def main_screen() -> None:
                 s_ = ro.survival.get(c.sleeper_id, c.survival) if ro is not None else c.survival
                 st.write(f"Survives to pick {rec.next_pick}: **{s_:.0%}**  |  ADP {c.adp:.0f}")
             st.write(f"Games share {r['share_hat']:.0%}" + (f"  |  {r['injury_status']}" if r.get("injury_status") else ""))
+            if minutes_text(r):
+                st.write("Minutes " + minutes_text(r))
+            if role_text(r):
+                st.caption("Role: " + role_text(r))
             drv = top_drivers(r, "fp")
             if drv:
                 st.caption("Projection drivers (TreeSHAP, FP/G): " + ", ".join(f"{g} {v:+.1f}" for g, v in drv))
@@ -363,7 +411,8 @@ def main_screen() -> None:
             table = table.filter(pl.col("name").str.to_lowercase().str.contains(q.lower(), literal=True))
         show = table.select(
             "name", pl.col("positions").list.join("/").alias("pos"), "team_now", pl.col("adp").round(0),
-            pl.col("fp_pg").round(1), pl.col("lockin_3").round(1), pl.col("share_hat").round(2),
+            pl.col("fp_pg").round(1), pl.col("lockin_3").round(1), pl.col("mpg_hat").round(1).alias("min"),
+            pl.col("share_hat").round(2),
             pl.col("vor_per_week").round(1), pl.col("survival").round(2), pl.col("score_gap").round(1), "injury_status",
         ).head(150)
         st.dataframe(show.to_pandas(), hide_index=True, height=420)

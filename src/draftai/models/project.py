@@ -10,6 +10,8 @@ import polars as pl
 
 from draftai.features.asof import AsOf
 from draftai.features.build import COMPONENTS, build_features, rookie_rows
+from draftai.features.roles import newcomer_minutes, team_minutes_target
+from draftai.models.budget import apply_budget, apply_overrides
 from draftai.models.rookies import pick_bucket, rookie_baseline
 from draftai.scoring import ScoringSettings
 
@@ -36,7 +38,8 @@ def project_rows(feats: pl.DataFrame, models, settings: ScoringSettings) -> pl.D
             pred,
             pl.DataFrame(_quantile_cols("fp", fpq) + _quantile_cols("share", shq)),
             q,
-            feats.select("team_now", "age", "fp_pg_1", "share_1", "gp_1", "mpg_1", "fp_pg_w", "share_w"),
+            feats.select("team_now", "age", "fp_pg_1", "share_1", "gp_1", "mpg_1", "fp_pg_w", "share_w", "last_team",
+                         "new_team", "opp_team_mpg", "opp_pos_mpg", "opp_dep", "opp_arr", "opp_new", "opp_ret"),
         ],
         how="horizontal",
     ).with_columns(pl.lit(False).alias("rookie"), pl.lit(q_lg).alias("q_league"))
@@ -96,7 +99,8 @@ def season_projections(
     extra_rookies: pl.DataFrame | None = None,
     explain: bool = False,
 ) -> pl.DataFrame:
-    """Veterans from the models, rookies from the draft-slot baseline.
+    """Veterans from the models, rookies from the draft-slot baseline, then the team
+    minutes budget over both (``models.minutes_budget`` is its strength; 0 turns it off).
 
     ``roster`` (player_id, team) is the team at the cut-off. ``extra_rookies``
     (player_id, team) adds players with no NBA history who are not in the draft class
@@ -105,15 +109,9 @@ def season_projections(
     view = AsOf.view(player_games, team_games, as_of)
     recent = view.player_games.filter(pl.col("season") >= target_season - 3).select("player_id").unique()
     vet_pool = None if pool is None else pool.join(recent, on="player_id", how="semi")
-    feats = build_features(view, target_season, roster, bio, draft, settings, pool=vet_pool)
-    vets = project_rows(feats, models, settings)
-    if explain and vets.height:
-        from draftai.models.explain import projection_drivers
-
-        vets = vets.join(projection_drivers(models, feats), on="player_id", how="left")
-    q_lg = float(vets["q_league"][0]) if vets.height else 0.06
     base = rookie_baseline(view.player_games, view.team_games, draft, settings, before_season=target_season)
-    # Newcomers: this year's draft class, plus pool players with no recent NBA games.
+    # Newcomers first: their minutes are arrivals in the veterans' role features.
+    # This year's draft class, plus pool players with no recent NBA games.
     if pool is None:
         new_ids = rookie_rows(draft, target_season).select("player_id")
     else:
@@ -127,8 +125,19 @@ def season_projections(
         teams = pl.concat([teams, extra_rookies.select("player_id", "team")]).unique("player_id")
     rk = new_ids.join(picks, on="player_id", how="left").join(teams, on="player_id", how="left").with_columns(
         pl.lit(target_season, dtype=pl.Int32).alias("season"))
+    newcomers = newcomer_minutes(rk.select("player_id", pl.coalesce("team", "draft_team").alias("team"), "draft_pick"),
+                                 base) if rk.height else None
+
+    feats = build_features(view, target_season, roster, bio, draft, settings, pool=vet_pool, newcomers=newcomers)
+    vets = project_rows(feats, models, settings)
+    if explain and vets.height:
+        from draftai.models.explain import projection_drivers
+
+        vets = vets.join(projection_drivers(models, feats), on="player_id", how="left")
+    q_lg = float(vets["q_league"][0]) if vets.height else 0.06
     rooks = rookie_projections(rk, base, q_lg, settings) if rk.height else None
     out = vets if rooks is None else pl.concat([vets, rooks], how="diagonal_relaxed")
+    out = apply_budget(out, team_minutes_target(view.team_games), getattr(models, "minutes_budget", 0.0), settings)
     return out.with_columns(pl.lit(as_of).alias("as_of"))
 
 
@@ -156,3 +165,38 @@ def apply_availability_overrides(proj: pl.DataFrame, path: Path, id_col: str = "
         (pl.col("share_p90") * ratio).clip(0, 1).alias("share_p90"),
         (pl.col("share").is_not_null() | pl.col("multiplier").is_not_null()).alias("availability_override"),
     ).drop("share", "multiplier")
+
+
+def apply_minutes_overrides(proj: pl.DataFrame, path: Path, settings: ScoringSettings,
+                            log_dir: Path | None = None, log=print) -> pl.DataFrame:
+    """Manual minutes per game for preseason news the model cannot know (a starting job
+    announced, a move to the bench). Applied after the model and the team budget, so the
+    model and its evaluation are untouched; teammates absorb the change (models/budget.py).
+
+    CSV columns: sleeper_id, mpg, note (optional ``name``, for readability only). Every
+    application is logged to ``log_dir/minutes_overrides_log.csv``.
+    """
+    flags = [pl.lit(False).alias("minutes_override"), pl.lit(None, dtype=pl.Utf8).alias("minutes_note"),
+             pl.lit(0.0).alias("override_delta")]
+    if not path.exists():
+        return proj.with_columns(flags)
+    o = pl.read_csv(path, schema_overrides={"sleeper_id": pl.Utf8, "mpg": pl.Float64, "note": pl.Utf8})
+    if o.height == 0 or "mpg" not in o.columns:
+        return proj.with_columns(flags)
+    out, changes = apply_overrides(proj, o, settings)
+    for r in changes.iter_rows(named=True):
+        if r["status"] != "applied":
+            log(f"minutes override for {r['sleeper_id']}: {r['status']}")
+            continue
+        log(f"minutes override: {r['name']} ({r['team']}) {r['before_mpg']:.1f} -> {r['override_mpg']:.1f} min/game "
+            f"(model {r['model_mpg']:.1f}); {r['teammates']} teammates adjusted" + (f"; {r['note']}" if r["note"] else ""))
+    if log_dir is not None:
+        from datetime import datetime
+
+        log_dir.mkdir(parents=True, exist_ok=True)
+        f = log_dir / "minutes_overrides_log.csv"
+        stamped = changes.with_columns(pl.lit(datetime.now().isoformat(timespec="seconds")).alias("applied_at"))
+        if f.exists():
+            stamped = pl.concat([pl.read_csv(f, schema_overrides=stamped.schema), stamped], how="vertical_relaxed")
+        stamped.write_csv(f)
+    return out

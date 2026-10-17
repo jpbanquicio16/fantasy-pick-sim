@@ -31,13 +31,16 @@ from the features so the projection can disagree with the market.
 - Preprocessing (imputation, scaling) is fitted inside each fold; rolling-origin
   validation by season; the test season is evaluated once with all choices frozen.
 - Known approximation: historical rows use each player's first team of the season as
-  the team at the cut-off.
+  the team at the cut-off (live: Sleeper's current team). Role features use only last
+  season's games and that roster; rookies enter at draft-slot minutes estimated from
+  earlier draft classes.
 
 ## Models
 
 | Target | Model |
 |---|---|
 | Minutes, per-minute rates, games share, bonus FP | LightGBM (shallow, monotone-constrained) blended with ridge; blend weight per target chosen on validation |
+| Team minutes budget | Post-model: each team's expected minutes (rookies included) pulled 25% of the way to the league's minutes per team game, by elasticity m(1 - m/40); strength chosen on validation |
 | Direct FP/G (cross-check, explanations) | Same blend |
 | Season FP/G interval | LightGBM quantiles of the residual around a Marcel-style anchor, re-centred on the point projection, conformally calibrated |
 | Games-share interval | LightGBM quantiles, conformally calibrated |
@@ -47,24 +50,62 @@ from the features so the projection can disagree with the market.
 Per-minute rates are shrunk toward a height-bucket prior by empirical Bayes; noisier stats
 (steals, blocks) are shrunk harder.
 
+**Team moves and role changes.** Features include a new-team flag, last season's team pace
+and net minutes opportunity: minutes that left the player's team since last season, minus
+minutes that arrived (trades and signings at last season's minutes, rookies at draft-slot
+minutes) and minutes of teammates returning from a long absence (15+ games missed), each
+relative to the league's average team that offseason, unweighted (`opp_team_mpg`) and
+weighted toward his height bucket (`opp_pos_mpg`: same bucket 1, adjacent 0.5, guard-big 0).
+His own arrival or return is excluded. Retirements are not counted as departures (history
+cannot tell them from season-long injuries without looking ahead).
+
+The team minutes budget then makes the arithmetic add up. Its strength was chosen on the
+four validation seasons (FP/G MAE, top 200): 0 gives 2.344, **0.25 gives 2.339**, 0.5 2.345,
+1.0 (a full rescale) 2.390. Proportional rescaling (the design's first proposal) was worse
+still in a pre-study, because it cuts stars' minutes for the noise in their bench's
+projections; the elasticity puts the change on mid-rotation players.
+
+**Minutes overrides** (`configs/minutes_overrides.csv`, or the app) pin a player's minutes
+after preseason news; the change is absorbed in full by his teammates, weighted toward his
+Sleeper positions (others 0.3x). They are applied after the model, logged, and never reach
+training or evaluation.
+
 ## Evaluation (FP/G, top 200 draftable, players with 10+ games)
 
 | Split | Components MAE | Marcel MAE | Gain (95% CI) | 80% interval coverage |
 |---|---|---|---|---|
-| 2021-22 | 2.58 | 2.96 | +0.38 (+0.15, +0.61) | 80% |
-| 2022-23 | 2.39 | 2.94 | +0.55 (+0.34, +0.75) | 78% |
-| 2023-24 | 2.28 | 2.70 | +0.42 (+0.22, +0.64) | 81% |
-| 2024-25 | 2.18 | 2.54 | +0.36 (+0.14, +0.57) | 87% |
-| **2025-26 test** | **2.64** | **2.90** | **+0.26 (+0.05, +0.47)** | **80%** |
+| 2021-22 | 2.55 | 2.96 | +0.41 (+0.19, +0.63) | 80% |
+| 2022-23 | 2.34 | 2.94 | +0.60 (+0.40, +0.80) | 77% |
+| 2023-24 | 2.28 | 2.70 | +0.42 (+0.21, +0.62) | 82% |
+| 2024-25 | 2.19 | 2.54 | +0.35 (+0.14, +0.55) | 87% |
+| **2025-26 test** | **2.62** | **2.90** | **+0.28 (+0.07, +0.49)** | **80%** |
+
+Role-change cohorts (players with 10+ games; validation mean, FP/G MAE and bias = projected
+minus actual; full tables in `projection_report.md`):
+
+| Cohort | n/season | Marcel MAE | Model MAE | Model bias | 80% coverage |
+|---|---|---|---|---|---|
+| Everyone | 419 | 3.06 | 2.57 | +0.53 | 80% |
+| Changed teams | 116 | 3.41 | 2.83 | +0.80 | 78% |
+| Returning from a long absence | 125 | 3.58 | 2.86 | +0.73 | 78% |
+| Team filled 15+ min/game at his positions | 90 | 2.99 | 2.39 | +0.40 | 85% |
+| Team opened 15+ min/game at his positions | 131 | 3.00 | 2.52 | +0.67 | 80% |
+| Minutes fell 5+ (defined by the outcome) | 66 | 4.77 | 4.16 | +4.13 | 62% |
+
+The opportunity signal is real but weak: players whose team opened 10+ minutes a game at
+their positions changed their minutes by about 1.3 a game more than those whose team filled
+10+ (+0.4 against -0.9). The model beats Marcel in every
+cohort; the largest remaining error is the role loss nobody saw coming (last row), which is
+what minutes overrides are for.
 
 Season-value rank correlation with realised value (Spearman, top 200) is 0.65 in
 validation and 0.51 in the test season, against 0.86 and 0.84 for FP/G alone: games
 played is the harder half of the problem.
 
 **Lock-In layer.** On held-out 2025-26 player-weeks, projected Lock-In value beats mean
-FP/G as a predictor of the realised locked score (MAE 6.46 vs 7.16). It is close to
-unbiased when the player plays every game in the week (+0.36) and optimistic in weeks with
-a mid-week absence (+6.8), because availability is modelled week by week.
+FP/G as a predictor of the realised locked score (MAE 6.42 vs 7.15). It is close to
+unbiased when the player plays every game in the week (+0.27) and optimistic in weeks with
+a mid-week absence (+6.6), because availability is modelled week by week.
 
 ## Opponent model (V4)
 

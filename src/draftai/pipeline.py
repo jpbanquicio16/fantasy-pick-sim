@@ -121,9 +121,16 @@ def foul_rates(season: int, settings: ScoringSettings, log=print) -> pl.DataFram
 
 
 def project(ctx: LeagueContext, sim: SimConfig, paths: Paths, as_of: date | None = None,
-            adp_csv: Path | None = None, log=print) -> Board:
+            adp_csv: Path | None = None, adp_from: pl.DataFrame | None = None, log=print) -> Board:
+    """Project the season and build the board. ADP comes from ``adp_csv``, else
+    ``adp_from`` (sleeper_id, adp, adp_source[, adp_sd]: e.g. the previous board's, so a
+    rebuild keeps ADP aggregated from your drafts), else Sleeper's search rank."""
     from draftai.models.artifacts import load_models
-    from draftai.models.project import apply_availability_overrides, season_projections
+    from draftai.models.project import (
+        apply_availability_overrides,
+        apply_minutes_overrides,
+        season_projections,
+    )
 
     Y = ctx.season
     pg, tg = tables.load_table("player_games", paths), tables.load_table("team_games", paths)
@@ -147,6 +154,10 @@ def project(ctx: LeagueContext, sim: SimConfig, paths: Paths, as_of: date | None
         .unique("sleeper_id", keep="first")
     )
     proj = apply_availability_overrides(proj, paths.configs / "availability_overrides.csv")
+    log(f"team minutes budget: strength {models.minutes_budget:g}, target "
+        f"{float(proj['team_minutes_target'][0]):.1f} min per team game")
+    proj = apply_minutes_overrides(proj, paths.configs / "minutes_overrides.csv", ctx.scoring,
+                                   log_dir=board_dir(paths, Y), log=log)
     fouls = foul_rates(Y - 1, ctx.scoring, log)
     if fouls is not None:
         proj = proj.join(fouls, on="sleeper_id", how="left").with_columns(
@@ -160,7 +171,12 @@ def project(ctx: LeagueContext, sim: SimConfig, paths: Paths, as_of: date | None
     log(f"projected {proj.height} players as of {as_of}; back-to-back rest multiplier {b2b:.2f}")
     board = build_board(proj, hist, schedule, plan, ctx.scoring, ctx.roster_positions, ctx.teams, b2b, Y,
                         sim.game_samples, sim.min_donor_games, sim.donor_neighbours, sim.seed, log=log)
-    adp = adp_mod.from_csv(adp_csv, board.players) if adp_csv else adp_mod.from_search_rank(board.players)
+    if adp_csv:
+        adp = adp_mod.from_csv(adp_csv, board.players)
+    elif adp_from is not None:
+        adp = adp_from.select([c for c in ("sleeper_id", "adp", "adp_source", "adp_sd") if c in adp_from.columns])
+    else:
+        adp = adp_mod.from_search_rank(board.players)
     board.players = adp_mod.attach(board.players, adp)
     board.save(board_dir(paths, Y))
     log(f"board saved to {board_dir(paths, Y)}")

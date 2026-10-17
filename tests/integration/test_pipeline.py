@@ -60,6 +60,29 @@ def test_artifacts_round_trip(training, tmp_path):
     assert np.allclose(r.models_final.fp_q.predict(ts, point), loaded.fp_q.predict(ts, point))
 
 
+def test_training_chooses_and_saves_the_minutes_budget(training, tmp_path):
+    from draftai.models.budget import STRENGTH_GRID
+
+    _, r = training
+    assert r.budget_strength in STRENGTH_GRID and r.models_final.minutes_budget == r.budget_strength
+    assert set(r.budget_grid["strength"].unique()) == set(STRENGTH_GRID)
+    assert {"components_blend", "components_no_budget"} <= set(r.validation["model"].unique())
+    assert {"all", "changed teams", "returning from a long absence"} <= set(r.cohorts["cohort"].unique())
+    loaded = r.models_final
+    loaded.minutes_budget = 0.5
+    save_models(loaded, tmp_path, CFG, date(2023, 10, 1))
+    assert load_models(tmp_path).minutes_budget == 0.5
+    loaded.minutes_budget = r.budget_strength
+
+
+def test_board_carries_role_and_budget_columns(board):
+    p = board.players
+    assert {"mpg_model", "budget_delta", "team_minutes", "opp_pos_mpg", "new_team"} <= set(p.columns)
+    assert np.allclose(p["mpg_hat"] - p["mpg_model"], p["budget_delta"])
+    vets = p.filter(~pl.col("rookie"))
+    assert vets["opp_pos_mpg"].null_count() == 0
+
+
 def test_quantiles_ordered_and_centred(board):
     p = board.players.filter(~pl.col("rookie"))
     assert (p["fp_p10"] <= p["fp_p50"]).all() and (p["fp_p50"] <= p["fp_p90"]).all()

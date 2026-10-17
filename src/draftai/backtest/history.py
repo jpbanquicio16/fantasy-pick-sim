@@ -94,16 +94,23 @@ def fold_models(season: int, train_cfg: TrainConfig, paths: Paths, log=print):
     chosen on the rolling validation seasons, so for those seasons the backtest carries a
     mild hyperparameter look-ahead. The test season is clean.
     """
+    import json
+    from datetime import date
+
+    from draftai.features.build import FP_FEATURES
     from draftai.models.artifacts import load_models, save_models
     from draftai.models.train import _fit, _new_models
 
-    if season == train_cfg.test_season and (paths.artifacts / "models" / "test" / "manifest.json").exists():
+    def current(directory: Path) -> bool:
+        """Saved with today's feature set (older folds are refitted after a feature change)."""
+        m = directory / "manifest.json"
+        return m.exists() and json.loads(m.read_text())["fp_q"]["features"] == FP_FEATURES
+
+    if season == train_cfg.test_season and current(paths.artifacts / "models" / "test"):
         return load_models(paths.artifacts / "models" / "test")
     d = paths.artifacts / "models" / f"fold_{season}"
-    if (d / "manifest.json").exists():
+    if current(d):
         return load_models(d)
-    import json
-    from datetime import date
 
     final = json.loads((paths.artifacts / "models" / "final" / "manifest.json").read_text())
     ts = pl.read_parquet(paths.features / "training_set.parquet")
@@ -112,6 +119,7 @@ def fold_models(season: int, train_cfg: TrainConfig, paths: Paths, log=print):
         raise ValueError(f"no training seasons before {season}")
     models = _fit(_new_models(train_cfg), train)
     models.projection.set_blends(final["blends"])
+    models.minutes_budget = float(final.get("minutes_budget", 0.0))
     models.fp_q.adj_lo, models.fp_q.adj_hi = final["fp_q"]["adj"]
     models.share_q.adj_lo, models.share_q.adj_hi = final["share_q"]["adj"]
     save_models(models, d, train_cfg, date.today(), {"trained_through": season - 1})
@@ -329,7 +337,7 @@ def season_key(season: int, rules: LeagueRules, sim: SimConfig, game_samples: in
     blob = json.dumps({"season": season, "roster": rules.roster_positions, "scoring": rules.scoring.weights,
                        "stack": rules.scoring.bonus_stacking, "po": [rules.playoff_week_start, rules.playoff_teams,
                        rules.playoff_round_type, rules.playoff_weight], "seed": sim.seed, "samples": game_samples,
-                       "donors": [sim.min_donor_games, sim.donor_neighbours], "v": 3}, sort_keys=True)
+                       "donors": [sim.min_donor_games, sim.donor_neighbours], "v": 4}, sort_keys=True)
     return f"{season}_{hashlib.sha256(blob.encode()).hexdigest()[:10]}"
 
 

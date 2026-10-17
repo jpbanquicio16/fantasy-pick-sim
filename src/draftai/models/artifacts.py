@@ -53,6 +53,7 @@ def save_models(models: Models, directory: Path, cfg: TrainConfig, snapshot: dat
         "train_config": json.loads(cfg.model_dump_json()),
         "versions": {"lightgbm": lgb.__version__, "sklearn": sklearn.__version__},
         "blends": pm.blends,
+        "minutes_budget": models.minutes_budget,
         "fp_q": {"target": models.fp_q.target, "features": models.fp_q.features, "quantiles": list(models.fp_q.quantiles),
                  "adj": [models.fp_q.adj_lo, models.fp_q.adj_hi], "min_gp": models.fp_q.min_gp, "anchor": models.fp_q.anchor,
                  "clip": list(models.fp_q.clip)},
@@ -85,4 +86,6 @@ def load_models(directory: Path) -> Models:
         for q in qm.quantiles:
             qm.models[q] = lgb.Booster(model_file=str(directory / f"{label}_{q}.txt"))
         qms[label] = qm
-    return Models(projection=pm, fp_q=qms["fp_q"], share_q=qms["share_q"])
+    # Models saved before the team minutes budget existed project without it.
+    return Models(projection=pm, fp_q=qms["fp_q"], share_q=qms["share_q"],
+                  minutes_budget=float(man.get("minutes_budget", 0.0)))

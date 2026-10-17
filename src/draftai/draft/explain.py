@@ -24,6 +24,46 @@ def stocks_share(row: dict, settings: ScoringSettings) -> float:
     return (contrib.get("stl", 0.0) + contrib.get("blk", 0.0)) / pos if pos else 0.0
 
 
+ROLE_NOTE = 10.0  # minutes per team game of opportunity worth a line on the card
+
+
+def minutes_text(row: dict) -> str | None:
+    """Projected minutes, beside the model's own figure when the team minutes budget or an
+    override (his own, or a teammate's) moved them."""
+    m = row.get("mpg_hat")
+    if m is None:
+        return None
+    model = row.get("mpg_model")
+    if row.get("minutes_override"):
+        note = f": {row['minutes_note']}" if row.get("minutes_note") else ""
+        return f"{m:.1f} min/game (your override{note}; model {model:.1f})" if model is not None else f"{m:.1f} min/game (your override{note})"
+    parts = []
+    if model is not None and row.get("budget_delta") is not None and abs(row["budget_delta"]) >= 0.05:
+        parts.append(f"team minutes budget {row['budget_delta']:+.1f}")
+    if abs(row.get("override_delta") or 0.0) >= 0.05:
+        parts.append(f"teammates' overrides {row['override_delta']:+.1f}")
+    if not parts or model is None:
+        return f"{m:.1f} min/game"
+    return f"{m:.1f} min/game (model {model:.1f}; " + ", ".join(parts) + ")"
+
+
+def role_text(row: dict) -> str | None:
+    """A team change, and minutes his team opened up or filled at his positions since last
+    season, against a typical team (features/roles.py), by its largest channels."""
+    bits = []
+    if row.get("new_team") == 1 and row.get("last_team") and row.get("team_now"):
+        bits.append(f"new team ({row['last_team']} to {row['team_now']})")
+    opp = row.get("opp_pos_mpg")
+    if opp is not None and abs(opp) >= ROLE_NOTE:
+        effects = {"departures": row.get("opp_dep") or 0.0, "arrivals": -(row.get("opp_arr") or 0.0),
+                   "rookies": -(row.get("opp_new") or 0.0), "teammates returning": -(row.get("opp_ret") or 0.0)}
+        top = sorted(effects.items(), key=lambda kv: -abs(kv[1]))[:2]
+        verb = "opened" if opp > 0 else "filled"
+        bits.append(f"team {verb} {abs(opp):.0f} min/game at his positions vs a typical team ("
+                    + ", ".join(f"{k} {v:+.0f}" for k, v in top) + ")")
+    return "; ".join(bits) if bits else None
+
+
 def card(rec: Recommendation, board_players: pl.DataFrame, settings: ScoringSettings, rollout=None) -> dict:
     """``rollout`` (a RolloutResult for the same state) reorders the candidates and adds
     confidence; the greedy recommender still supplies survival and value components."""
@@ -82,6 +122,8 @@ def card(rec: Recommendation, board_players: pl.DataFrame, settings: ScoringSett
         "fp_pg": ra["fp_pg"],
         "fp_p10": ra["fp_p10"],
         "fp_p90": ra["fp_p90"],
+        "minutes": minutes_text(ra),
+        "role": role_text(ra),
         "lockin_3": ra["lockin_3"],
         "lockin_premium_3": ra["lockin_premium_3"],
         "vor_per_week": ra["vor_per_week"],
@@ -114,6 +156,10 @@ def render(c: dict) -> str:
         f"Lock-In value        {c['lockin_3']:.1f} per slot-week with 3 games (+{c['lockin_premium_3']:.1f} from game-to-game spread)",
         f"Value over repl.     {c['vor_per_week']:+.1f} per week",
     ]
+    if c.get("minutes"):
+        lines.append(f"Minutes              {c['minutes']}")
+    if c.get("role"):
+        lines.append(f"Role                 {c['role']}")
     if c["next_pick"]:
         rs = f"   ({c['runner_up']}: {c['runner_up_survival']:.0%})" if c["runner_up"] else ""
         lines.append(f"Survival to pick {c['next_pick']:<4} {c['survival']:.0%}{rs}")

@@ -58,6 +58,12 @@ Other commands:
 - `configs/availability_overrides.csv`: manual games-share overrides for news the model
   cannot know (a season-ending injury, a return from one). Copy the `.example.csv`.
   Columns: `sleeper_id`, then `share` (absolute, 0-1) or `multiplier`, and `note`.
+- `configs/minutes_overrides.csv`: expected minutes per game for preseason news the model
+  cannot know (a starting job announced, a move to the bench). Copy the `.example.csv`.
+  Columns: `sleeper_id`, `name` (for readability), `mpg`, `note`. Teammates absorb the change,
+  mostly at his positions; the model and its evaluation are untouched. Also editable in the
+  app's sidebar, which rebuilds the board (a few seconds). Every application is logged to
+  `data/artifacts/board/<season>/minutes_overrides_log.csv`.
 - `configs/id_overrides.csv`: manual NBA to Sleeper id matches, if the crosswalk misses one.
 - `configs/train.yaml`, `configs/sim.yaml`: seasons, model parameters, simulation size, ADP spread,
   rollout size (`rollout_worlds`, `rollout_shortlist`), waiver cover in simulated seasons.
@@ -81,19 +87,41 @@ technical and flagrant fouls; the engine scores them whenever the league does.
 | Last season | 2.64 | 2.97 |
 | Marcel-style 5/3/2 | 2.78 | 2.90 |
 | Ridge baseline | 2.74 | 2.87 |
-| **Components (LightGBM + ridge blend)** | **2.36** | **2.64** |
+| **Components (LightGBM + ridge blend, team minutes budget)** | **2.34** | **2.62** |
 
 The component model beats Marcel in all four validation seasons, each with a paired
-bootstrap 95% interval above zero (+0.36 to +0.55 FP/G), and in the test season
-(+0.26, interval +0.05 to +0.47).
+bootstrap 95% interval above zero (+0.35 to +0.60 FP/G), and in the test season
+(+0.28, interval +0.07 to +0.49).
 
-**Uncertainty.** Conformalised 80% intervals for season FP/G cover 78-87% in validation
-and 80% (top 200) in the test season; games-share intervals cover 78%.
+**Uncertainty.** Conformalised 80% intervals for season FP/G cover 77-87% in validation
+and 80% (top 200) in the test season; games-share intervals cover 79%.
+
+**Team moves and reduced roles.** A player's team at the cut-off comes from Sleeper (in
+history, his first game of the season). A role change reaches the projection two ways:
+
+- *Net minutes opportunity at his positions* (features): minutes that left his team since
+  last season, minus minutes that arrived (trades, signings, rookies at their draft-slot
+  minutes) and minutes of teammates returning from long absences; relative to the league's
+  average team, weighted toward his position group (guard, wing, big).
+- *A team minutes budget*: each team's expected minutes, rookies included, are pulled toward
+  the 241 that exist per team game, mostly from mid-rotation players (36-minute starters
+  barely move). Validation chose a strength of 0.25. Pulling all the way to 241, as the design
+  proposed, made FP/G worse (2.39 against 2.34): team sums of separately projected players
+  are noisy, and their spread is almost uncorrelated with what those players went on to play.
+
+Together they take FP/G MAE from 2.356 to 2.339 in validation and 2.640 to 2.622 in the test
+season: small, consistent gains. The cohort tables in `projection_report.md` show where it
+stays hard: players whose team filled 15+ minutes a game at their positions are still
+over-projected by about 0.4 FP/G, and players whose minutes fell by 5+ (defined by the outcome,
+so a diagnostic) by 4.1. Minutes overrides (above) are the tool for news the model cannot see.
+In simulated seasons (rollouts, mock projections) a player's absence hands his minutes to his
+teammates in the weeks he is out, so teammates' seasons are negatively correlated; averages are
+unchanged.
 
 **Lock-In (V2 gate: pass).** On 3,870 held-out 2025-26 player-weeks, the projected Lock-In
-value predicts the realised locked score better than mean FP/G (MAE 6.46 vs 7.16, gain
-+0.70, 95% CI +0.46 to +0.92). In weeks where the player played every game it is close to
-unbiased (+0.36), while mean FP/G understates by 3.5. The lockable premium follows the
+value predicts the realised locked score better than mean FP/G (MAE 6.42 vs 7.15, gain
++0.74, 95% CI +0.53 to +0.94). In weeks where the player played every game it is close to
+unbiased (+0.27), while mean FP/G understates by 3.6. The lockable premium follows the
 theory: 0.40, 0.63 and 0.79 SD for 2, 3 and 4 games.
 
 **Draft assistant (V3).** Recommendations take about 0.05 s per pick (budget: 5 s), follow a
@@ -180,8 +208,14 @@ mocks, not as a forecast. `draftai mock` does the same in the terminal.
   experiment report). Simulated seasons model absences as one block of weeks.
 - **Roster at the cut-off (training only).** Historical rows use each player's first team
   of the season as the cut-off team; live projections use Sleeper's current team.
+- **Roles.** Retirements and unsigned free agents are not counted as departures in the
+  opportunity features: in historical data they cannot be told apart from season-long injuries
+  without looking at the season itself. Live, they leave the team minutes budget instead. Live
+  newcomers include undrafted and two-way signings at the second-round baseline (training
+  counts the draft class only). Positions for the opportunity weighting come from height, so
+  that history and live projections use the same buckets.
 - **Not yet modelled:** DNP reasons (injury vs rest vs coach's decision), start rate, moving a
-  bench player into a passed slot mid-week, trades, and keeper value. Rollouts run in the app's
+  bench player into a passed slot mid-week, in-season trades, and keeper value. Rollouts run in the app's
   main thread (1-2 s) rather than in the background.
 
 ## Layout
@@ -192,8 +226,10 @@ src/draftai/
   normalise/   typed Parquet tables, NBA <-> Sleeper crosswalk
   validation/  Pandera schemas, cross-table checks
   scoring/     settings from Sleeper's scoring_settings; deterministic engine (half-points)
-  features/    as-of contract, player-season features, empirical-Bayes shrinkage
-  models/      baselines, component models, quantiles + conformal, rookies, artifacts, TreeSHAP
+  features/    as-of contract, player-season features, empirical-Bayes shrinkage; roles (team moves,
+               net minutes opportunity)
+  models/      baselines, component models, team minutes budget and minutes overrides, quantiles +
+               conformal, rookies, artifacts, TreeSHAP
   value/       game simulator, Lock-In stopping values, schedule weeks, lineup optimiser, VOR, board;
                worlds (simulated seasons), season (head-to-head schedules and the bracket)
   draft/       pick order, state, ADP, survival, recommender, explanations, league context;

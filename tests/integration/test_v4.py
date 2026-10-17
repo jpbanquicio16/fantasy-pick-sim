@@ -45,6 +45,23 @@ def test_worlds_average_to_the_board(board):
     assert (w.out_len >= 0).all() and (w.out_start + w.out_len <= w.weeks).all()
 
 
+def test_teammates_share_minutes_in_simulated_seasons(board):
+    """A teammate's absence raises a healthy player's week; averages are unchanged."""
+    on, off = Worlds.draw(board, 400, seed=1), Worlds.draw(board, 400, seed=1, teammates=False)
+    assert np.isclose(on.expected().sum(), off.expected().sum(), rtol=0.02)
+    p = board.players
+    team = p["team_now"].to_list()
+    a = int(np.argmax(p["mpg_hat"].to_numpy()))
+    mates = [j for j in range(p.height) if team[j] == team[a] and j != a]
+    wk = np.arange(on.weeks)
+    out = (wk >= on.out_start[..., None]) & (wk < (on.out_start + on.out_len)[..., None])
+    gone = out[:, mates].any(axis=1) & ~out[:, a]  # (worlds, weeks): a teammate out, he plays
+    full = ~out[:, mates].any(axis=1) & ~out[:, a]
+    ratio = on.values(np.arange(400), np.full((400, 1), a))[:, 0] / np.maximum(
+        off.values(np.arange(400), np.full((400, 1), a))[:, 0], 1e-9)
+    assert ratio[gone].mean() > 1.0 > ratio[full].mean()
+
+
 def test_rollout_recommends_and_is_reproducible(board, engine):
     state = DraftState.new(8, 13, 2)
     advance_by_adp(board, state, 15)  # slot 2 picks 2, 15, 18, ...
@@ -138,8 +155,9 @@ def test_mock_runs_to_the_end_and_projects_the_league(board):
     assert {m.by for m in mock.log} == {"auto", "engine"}
     proj = mock.projection(ev, n_worlds=60)
     assert proj.height == 6 and "You" in proj["team"].to_list()
-    assert proj["p_playoffs"].sum() == pytest.approx(4.0, abs=1e-6)
-    assert proj["p_title"].sum() == pytest.approx(1.0, abs=1e-6)
+    # Each team's odds are rounded to 3 decimals: six of them sum to within 6 x 0.0005.
+    assert proj["p_playoffs"].sum() == pytest.approx(4.0, abs=0.003)
+    assert proj["p_title"].sum() == pytest.approx(1.0, abs=0.003)
 
 
 # --- backtest mechanics ----------------------------------------------------------------

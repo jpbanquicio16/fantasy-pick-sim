@@ -21,7 +21,7 @@ FEATURE_GROUPS: dict[str, tuple[str, ...]] = {
     "usage": ("usage_1", "usage_2"),
     "availability history": ("share_1", "share_2", "share_3", "share_w", "longest_absence", "q_short"),
     "age and experience": ("age", "age2", "experience", "log_draft_pick", "height_in"),
-    "team change": ("new_team", "team_pace_1", "vacated_mpg"),
+    "team and role change": ("new_team", "team_pace_1", "opp_team_mpg", "opp_pos_mpg"),
 }
 
 

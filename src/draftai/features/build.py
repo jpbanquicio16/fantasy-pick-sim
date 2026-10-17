@@ -17,6 +17,7 @@ import numpy as np
 import polars as pl
 
 from draftai.features.asof import AsOf, season_cutoff
+from draftai.features.roles import newcomer_minutes, opportunity, team_minutes_target
 from draftai.scoring import ScoringSettings, score_frame
 
 COMPONENTS = ["pts", "reb", "ast", "stl", "blk", "tov", "fg3m"]
@@ -210,12 +211,15 @@ def build_features(
     draft: pl.DataFrame,
     settings: ScoringSettings,
     pool: pl.DataFrame | None = None,
+    newcomers: pl.DataFrame | None = None,
 ) -> pl.DataFrame:
     """Feature rows for ``target_season`` from games strictly before ``view.as_of``.
 
     ``roster`` (player_id, team) is the team each player is on at the cut-off. ``pool``
     (player_id) restricts the rows; by default every player with a game in either of the
-    two prior seasons, including those who would go on to miss the season.
+    two prior seasons, including those who would go on to miss the season. ``newcomers``
+    (player_id, team, mpg, share) are the rookies and other players without recent NBA
+    games joining each team, at their draft-slot expected minutes (``newcomer_minutes``).
     """
     Y = target_season
     pg, tg = view.player_games, view.team_games
@@ -337,19 +341,9 @@ def build_features(
                                                     pl.col("team_gp").alias("team_gp_1")),
         on="team_now", how="left",
     )
-    moved = rows.select("player_id", "team_now", "last_team", pl.col("min_1").fill_null(0.0))
-    departed = moved.filter(pl.col("last_team").is_not_null() & (pl.col("team_now") != pl.col("last_team"))).group_by(
-        pl.col("last_team").alias("team")
-    ).agg(pl.col("min_1").sum().alias("min_out"))
-    arrived = moved.filter(pl.col("team_now") != pl.col("last_team")).group_by(pl.col("team_now").alias("team")).agg(
-        pl.col("min_1").sum().alias("min_in")
-    )
-    vac = departed.join(arrived, on="team", how="full", coalesce=True).with_columns(
-        ((pl.col("min_out").fill_null(0) - pl.col("min_in").fill_null(0)) / 82.0).alias("vacated_mpg")
-    )
-    rows = rows.join(vac.select(pl.col("team").alias("team_now"), "vacated_mpg"), on="team_now", how="left").with_columns(
-        pl.col("vacated_mpg").fill_null(0.0)
-    )
+    # Role change: minutes his team opened up or filled since last season (features/roles.py).
+    rows = opportunity(rows, pg.filter(pl.col("season") == Y - 1), newcomers).with_columns(
+        pl.lit(team_minutes_target(tg)).alias("team_min_target"))
     # Ratios over zero minutes (players logged with 0:00) are unknown, not infinite.
     floats = [c for c, t in rows.schema.items() if t in (pl.Float64, pl.Float32)]
     rows = rows.with_columns([pl.when(pl.col(c).is_finite()).then(pl.col(c)).otherwise(None).alias(c) for c in floats])
@@ -362,7 +356,7 @@ COMPONENT_FEATURES = [
     "gp_1", "gp_2", "gp_3", "mpg_1", "mpg_2", "mpg_3", "share_1", "share_2", "share_3",
     "min_w", "mpg_w", "share_w", "mpg_trend", "min_last20", "last20_minus_mpg", "usage_1", "usage_2",
     "used_per_min_w", "longest_absence", "q_short", "age", "age2", "experience", "log_draft_pick",
-    "height_in", "new_team", "team_pace_1", "vacated_mpg",
+    "height_in", "new_team", "team_pace_1", "opp_team_mpg", "opp_pos_mpg",
     *[f"rate_{c}" for c in COMPONENTS],
 ]
 FP_FEATURES = COMPONENT_FEATURES + [
@@ -421,7 +415,8 @@ def build_training_set(
         cut = season_cutoff(team_games, Y)
         view = AsOf.view(player_games, team_games, cut)
         roster = roster_from_first_game(player_games, Y)
-        feats = build_features(view, Y, roster, bio, draft, settings)
+        feats = build_features(view, Y, roster, bio, draft, settings,
+                               newcomers=draft_class_newcomers(view, draft, Y, roster, settings))
         targets, team_gp = build_targets(player_games, team_games, Y, settings)
         rows = feats.join(targets, on="player_id", how="left").with_columns(
             pl.col("y_gp").fill_null(0),
@@ -432,6 +427,19 @@ def build_training_set(
         frames.append(rows)
         log(f"features {Y}: {rows.height} rows (as of {cut})")
     return pl.concat(frames, how="diagonal_relaxed").sort("season", "player_id")
+
+
+def draft_class_newcomers(view: AsOf, draft: pl.DataFrame, target_season: int, roster: pl.DataFrame,
+                          settings: ScoringSettings) -> pl.DataFrame:
+    """The season's draft class at their draft-slot expected minutes (from classes before
+    it), on their team at the cut-off (else their draft team)."""
+    from draftai.models.rookies import rookie_baseline
+
+    base = rookie_baseline(view.player_games, view.team_games, draft, settings, before_season=target_season)
+    rk = draft.filter(pl.col("draft_year") == target_season).select(
+        "player_id", pl.col("overall_pick").alias("draft_pick"), pl.col("team").alias("draft_team")
+    ).join(roster.select("player_id", "team"), on="player_id", how="left")
+    return newcomer_minutes(rk.select("player_id", pl.coalesce("team", "draft_team").alias("team"), "draft_pick"), base)
 
 
 def rookie_rows(draft: pl.DataFrame, target_season: int, roster: pl.DataFrame | None = None) -> pl.DataFrame:
