@@ -8,6 +8,9 @@
   survival lookahead).
 * ``rollout``: the V4 Monte Carlo rollout recommender.
 * ``oracle``: highest realised season value, same slot rule. Hindsight; the ceiling.
+* ``ltr`` / ``ltr_sim``: the learning-to-rank experiment's rankers (V5, ``backtest/ltr.py``):
+  fine-tuned on realised outcomes, or distilled from the simulator only. Each season uses
+  the rankers trained without it.
 """
 
 from __future__ import annotations
@@ -110,7 +113,41 @@ class Rollout(Strategy):
         return a
 
 
-def build(names: list[str]) -> list[Strategy]:
+class Ranked(Strategy):
+    """A learning-to-rank ranker over the greedy recommender's top candidates."""
+
+    def __init__(self, name: str, stage: str, paths):
+        self.name, self.stage, self.paths = name, stage, paths
+
+    def prepare(self, sd, needs, evaluator, model, sim, rollout) -> None:
+        from draftai.backtest.ltr import ranker_path
+        from draftai.draft.ranker import Ranker
+
+        super().prepare(sd, needs, evaluator, model, sim, rollout)
+        self.sim = sim
+        path = ranker_path(self.paths, sd.season, self.stage)
+        if not path.exists():
+            raise FileNotFoundError(f"no {self.stage} ranker for {sd.season}; run `draftai ltr` first")
+        self.ranker = Ranker.load(path)
+        key = self.ranker.meta.get("season_key")
+        if key and sd.meta.get("cache_key") and key != sd.meta["cache_key"]:
+            import warnings
+
+            # Its features are relative to the board, so it still applies (e.g. a real draft with
+            # other scoring); after a retrain, rerun `draftai ltr` to refit on the new boards.
+            warnings.warn(f"the {self.stage} ranker for {sd.season} was trained on another board ({key})")
+
+    def choose(self, state, avail, counts) -> int:
+        from draftai.draft.ranker import query
+
+        _, cands, X = query(self.sd.board, state, self.sim, self.evaluator, self.needs, counts)
+        return self.ranker.choose(cands, X)
+
+
+LTR_STRATEGIES = {"ltr": "real", "ltr_sim": "sim", "ltr_real_only": "real_only"}
+
+
+def build(names: list[str], paths=None) -> list[Strategy]:
     table = {
         "adp": lambda: KeyGreedy("adp", "adp"),
         "points": lambda: KeyGreedy("points", "season_value"),
@@ -118,6 +155,7 @@ def build(names: list[str]) -> list[Strategy]:
         "greedy_survival": GreedySurvival,
         "rollout": Rollout,
         "oracle": lambda: KeyGreedy("oracle", "realised"),
+        **{n: (lambda n=n, st=st: Ranked(n, st, paths)) for n, st in LTR_STRATEGIES.items()},
     }
     unknown = [n for n in names if n not in table]
     if unknown:

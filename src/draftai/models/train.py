@@ -51,6 +51,8 @@ class Models:
     fp_q: QuantileModel
     share_q: QuantileModel
     minutes_budget: float = 0.0  # strength of the team minutes budget (models/budget.py)
+    rookies: object | None = None  # models.rookies.RookieModel; None = the draft-slot baseline
+    rate_prior: str = "bucket"  # how the per-minute rate features were shrunk (features/rates.py)
 
 
 @dataclass
@@ -70,9 +72,16 @@ class TrainResult:
     summary: dict = field(default_factory=dict)
 
 
+def projection_signature(cfg: TrainConfig) -> dict:
+    """What a saved model depends on beyond its training rows: the feature list and how the
+    features are built. Backtest folds are refitted when it changes."""
+    return {"features": FP_FEATURES, "rate_prior": getattr(cfg, "rate_prior", "bucket")}
+
+
 def _new_models(cfg: TrainConfig) -> Models:
     q = tuple(cfg.quantiles)
     return Models(
+        rate_prior=cfg.rate_prior,
         projection=ProjectionModel(cfg.lgbm, cfg.ridge_alpha, cfg.recency_half_life_seasons, cfg.seed),
         fp_q=QuantileModel("y_fp_pg", FP_FEATURES, cfg.lgbm, cfg.recency_half_life_seasons, cfg.seed, q,
                            min_gp=FP_MIN_GP, clip=(0.0, 90.0), anchor="fp_pg_w"),
@@ -189,6 +198,7 @@ def cohorts(d: pl.DataFrame) -> dict[str, np.ndarray]:
         "changed teams": col("new_team") == 1,
         "minutes fell 5+ (outcome)": (col("gp_1") >= 20) & (col("y_mpg") < col("mpg_1") - 5),
         "returning from a long absence": long_absent,
+        "second season": col("experience") == 1,
         f"team filled {OPP_COHORT:.0f}+ min/game at his positions": col("opp_pos_mpg") <= -OPP_COHORT,
         f"team opened {OPP_COHORT:.0f}+ min/game at his positions": col("opp_pos_mpg") >= OPP_COHORT,
     }

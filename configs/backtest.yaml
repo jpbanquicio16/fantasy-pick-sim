@@ -1,6 +1,6 @@
 # Draft backtest (draftai backtest). Seasons are start years: 2025 = 2025-26.
 seasons: [2021, 2022, 2023, 2024, 2025]
-strategies: [adp, points, vor, greedy_survival, rollout, oracle]
+strategies: [adp, points, vor, greedy_survival, rollout, ltr_sim, ltr, oracle]  # ltr*: after `draftai ltr`
 leagues: 96              # simulated leagues per season; your seat rotates through every slot
 expensive_leagues: 24    # the first N leagues also run greedy_survival and rollout
 schedules: 40            # random head-to-head schedules averaged per league
@@ -13,3 +13,11 @@ seed: 5
 jobs: 5                  # seasons run in parallel processes
 replay_schedules: 200    # schedules per real-draft replay
 room: calibrated         # simulated opponents: calibrated (tight to the market) or fitted (your real drafts)
+# V5: the learning-to-rank experiment (draftai ltr; backtest/ltr.py)
+ltr:
+  leagues: 24            # simulated leagues per season in which queries are collected
+  docs: 24               # candidates per query
+  worlds: 150            # rollout worlds per candidate for the simulator's labels
+  epsilon: 0.25          # exploration while collecting
+  sim_rounds: 300        # LambdaRank rounds on simulator labels (ltr_sim)
+  real_rounds: 100       # further rounds on realised labels (ltr)

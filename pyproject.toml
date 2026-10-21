@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "draftai"
-version = "0.4.0"
+version = "0.5.0"
 description = "Probabilistic draft assistant for Sleeper Lock-In fantasy basketball"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -23,6 +23,8 @@ dependencies = [
     "pyyaml>=6",
     "streamlit>=1.37",
     "plotly>=5.20",
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
 ]
 
 [project.optional-dependencies]

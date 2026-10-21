@@ -85,12 +85,23 @@ def normalise_bio(raw: pl.DataFrame, season: int) -> pl.DataFrame:
 
 
 def normalise_draft(raw: pl.DataFrame) -> pl.DataFrame:
+    """``org_type`` is where he came from (College/University, Other Team/Club for
+    international and other professional clubs, High School); the rookie model uses it."""
+    def opt(col: str, dtype) -> pl.Expr:
+        if col not in raw.columns:
+            return pl.lit(None, dtype=dtype)
+        e = pl.col(col).cast(dtype, strict=False)
+        return e.replace("", None) if dtype == pl.Utf8 else e
+
     return raw.select(
         pl.col("SEASON").cast(pl.Int32).alias("draft_year"),
         pl.col("PERSON_ID").cast(pl.Int64).alias("player_id"),
         pl.col("PLAYER_NAME").alias("player_name"),
         pl.col("OVERALL_PICK").cast(pl.Int32).alias("overall_pick"),
         pl.col("TEAM_ABBREVIATION").alias("team"),
+        opt("ROUND_NUMBER", pl.Int32).alias("round_number"),
+        opt("ORGANIZATION_TYPE", pl.Utf8).alias("org_type"),
+        opt("ORGANIZATION", pl.Utf8).alias("organization"),
     )
 
 
@@ -168,8 +179,16 @@ def ingest_seasons(
         write_table(tg, paths, "team_games", s)
         write_table(normalise_bio(client.player_bio(s), s), paths, "player_bio", s)
         log(f"season {s}: {pg.height} player-games, {tg['game_id'].n_unique()} games")
-    drafts = [normalise_draft(client.draft_history(y)) for y in range(min(seasons), target_season + 1)]
-    write_table(pl.concat(drafts), paths, "draft_class")
+    refresh_draft_class(range(min(seasons), target_season + 1), client, paths)
     sched = normalise_schedule(client.schedule(target_season), target_season, include_cup_final)
     write_table(sched, paths, "schedule", target_season)
     log(f"schedule {target_season}: {sched['game_id'].n_unique()} games")
+
+
+def refresh_draft_class(years, client: NbaClient | None = None, paths: Paths | None = None) -> pl.DataFrame:
+    """Re-normalise the draft classes (from the raw cache: past drafts are never refetched)."""
+    paths = (paths or Paths()).ensure()
+    client = client or NbaClient()
+    drafts = pl.concat([normalise_draft(client.draft_history(y)) for y in years], how="vertical_relaxed")
+    write_table(drafts, paths, "draft_class")
+    return drafts

@@ -16,7 +16,7 @@ import sklearn
 from draftai.config import REPO_ROOT, TrainConfig
 from draftai.models.components import BlendModel, ProjectionModel, target_specs
 from draftai.models.quantiles import QuantileModel
-from draftai.models.train import Models
+from draftai.models.train import Models, projection_signature
 
 
 def _git_commit() -> str:
@@ -46,6 +46,11 @@ def save_models(models: Models, directory: Path, cfg: TrainConfig, snapshot: dat
         for q, m in qm.models.items():
             booster = m.booster_ if hasattr(m, "booster_") else m
             booster.save_model(str(directory / f"{label}_{q}.txt"))
+    rookie_file = directory / "rookies.joblib"
+    if models.rookies is not None:
+        joblib.dump(models.rookies, rookie_file)
+    elif rookie_file.exists():
+        rookie_file.unlink()
     manifest = {
         "snapshot_date": snapshot.isoformat(),
         "git_commit": _git_commit(),
@@ -54,6 +59,9 @@ def save_models(models: Models, directory: Path, cfg: TrainConfig, snapshot: dat
         "versions": {"lightgbm": lgb.__version__, "sklearn": sklearn.__version__},
         "blends": pm.blends,
         "minutes_budget": models.minutes_budget,
+        "signature": projection_signature(cfg),
+        "rate_prior": models.rate_prior,
+        "rookie_model": "model" if models.rookies is not None else "baseline",
         "fp_q": {"target": models.fp_q.target, "features": models.fp_q.features, "quantiles": list(models.fp_q.quantiles),
                  "adj": [models.fp_q.adj_lo, models.fp_q.adj_hi], "min_gp": models.fp_q.min_gp, "anchor": models.fp_q.anchor,
                  "clip": list(models.fp_q.clip)},
@@ -86,6 +94,8 @@ def load_models(directory: Path) -> Models:
         for q in qm.quantiles:
             qm.models[q] = lgb.Booster(model_file=str(directory / f"{label}_{q}.txt"))
         qms[label] = qm
-    # Models saved before the team minutes budget existed project without it.
+    # Models saved before the team minutes budget (or the rookie model) existed project without it.
+    rookies = joblib.load(directory / "rookies.joblib") if (directory / "rookies.joblib").exists() else None
     return Models(projection=pm, fp_q=qms["fp_q"], share_q=qms["share_q"],
-                  minutes_budget=float(man.get("minutes_budget", 0.0)))
+                  minutes_budget=float(man.get("minutes_budget", 0.0)), rookies=rookies,
+                  rate_prior=man.get("rate_prior", "bucket"))

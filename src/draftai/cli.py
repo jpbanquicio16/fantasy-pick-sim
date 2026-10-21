@@ -3,6 +3,8 @@
     draftai ingest              fetch + normalise + validate NBA data and Sleeper players
     draftai league              show the league settings the engine will use
     draftai train               features, rolling-origin evaluation, test season, final models
+    draftai rookies             refit and evaluate only the rookie model
+    draftai rates-experiment    compare the per-minute rate priors (bucket vs hierarchical)
     draftai project             project the draft season and build the board
     draftai lockin-experiment   the Lock-In headline experiment on the test season
     draftai adp                 show or refresh ADP (search rank, CSV, or your Sleeper drafts)
@@ -10,7 +12,9 @@
     draftai mock                offline mock draft; the other teams draft themselves
     draftai opponents           fit the opponent model on your real Sleeper drafts
     draftai backtest            paired draft backtest on past seasons, plus real-draft replays
+    draftai ltr                 learning-to-rank experiment (V5): collect, train, judge in the backtest
     draftai app                 launch the Streamlit draft assistant
+    draftai api                 serve the API and the React front end (FastAPI)
 """
 
 from __future__ import annotations
@@ -42,7 +46,13 @@ def cmd_ingest(args) -> None:
     from draftai import pipeline
 
     paths = Paths().ensure()
-    if args.sleeper_only:
+    if args.draft_only:
+        from draftai.normalise.tables import refresh_draft_class
+
+        train = load_train_config()
+        dr = refresh_draft_class(range(min(train.ingest_seasons), train.target_season + 1), paths=paths)
+        print(f"draft classes {dr['draft_year'].min()}-{dr['draft_year'].max()}: {dr.height} picks")
+    elif args.sleeper_only:
         pipeline.refresh_sleeper(paths)
     else:
         pipeline.ingest(load_train_config(), load_league_config(), paths)
@@ -64,6 +74,27 @@ def cmd_train(args) -> None:
     g = s["test_gain_vs_marcel"]
     print(f"Test season: FP/G MAE {s['test_fpg_mae_top200']:.2f} (top 200), gain vs Marcel {g[0]:+.2f} "
           f"[{g[1]:+.2f}, {g[2]:+.2f}]; 80% interval coverage {s['test_fpg_cov80_top200']:.0%}")
+
+
+def cmd_rookies(args) -> None:
+    from draftai import pipeline
+
+    ctx = _ctx(args)
+    pipeline.train_rookies(load_train_config(), ctx.scoring, Paths().ensure())
+
+
+def cmd_rates(args) -> None:
+    import json
+
+    from draftai.models import rate_experiment
+    from draftai.normalise.tables import load_table
+
+    paths = Paths()
+    ctx = _ctx(args)
+    pg, tg, bio, dr = (load_table(t, paths) for t in ("player_games", "team_games", "player_bio", "draft_class"))
+    summary = rate_experiment.run(pg, tg, bio, dr, ctx.scoring, load_train_config(), paths.artifacts / "reports")
+    print(json.dumps(summary, indent=2))
+    print(f"report: {paths.artifacts / 'reports' / 'rate_prior_report.md'}")
 
 
 def cmd_project(args) -> None:
@@ -339,6 +370,54 @@ def cmd_backtest(args) -> None:
     print(f"report: {report}  ({time.time() - t0:.0f} s)")
 
 
+def cmd_ltr(args) -> None:
+    """The learning-to-rank experiment (V5): collect, train leaving one season out, judge."""
+    import polars as pl
+
+    from draftai.backtest import ltr
+    from draftai.backtest.history import LeagueRules, season_key
+    from draftai.backtest.run import run, summary
+    from draftai.config import load_backtest_config
+
+    paths = Paths().ensure()
+    ctx = _ctx(args)
+    bt = load_backtest_config()
+    if args.seasons:
+        bt.seasons = args.seasons
+    if args.leagues:
+        bt.ltr.leagues = args.leagues
+    rules = LeagueRules.from_ctx(ctx)
+    sim, train_cfg = load_sim_config(), load_train_config()
+    t0 = time.time()
+    queries = ltr.collect(rules, sim, train_cfg, bt, paths)
+    print(f"{queries['query'].n_unique()} queries, {queries.height} documents ({time.time() - t0:.0f} s)")
+    if args.collect_only:
+        return
+    keys = {s: season_key(s, rules, sim, bt.game_samples, train_cfg) for s in bt.seasons}
+    ltr.train(queries, bt.ltr, paths, keys)
+    off = ltr.offline(queries, paths, bt.ltr.levels)
+    rows = None
+    if args.use_backtest_rows:
+        rows = pl.read_parquet(paths.artifacts / "reports" / "backtest_rows.parquet").filter(
+            pl.col("season").is_in(bt.seasons))
+    elif not args.no_backtest:
+        bt.strategies = args.strategies or ["adp", "vor", "greedy_survival", "rollout", "ltr_sim", "ltr"]
+        res = run(rules, sim, train_cfg, bt, paths)
+        rows = res.rows
+        rows.write_parquet(paths.artifacts / "reports" / "ltr_backtest_rows.parquet")
+        with pl.Config(tbl_rows=20, tbl_width_chars=160):
+            print(summary(rows))
+    report = ltr.write_report(queries, off, paths, rows, bt.ltr)
+    print(f"report: {report}  ({time.time() - t0:.0f} s)")
+
+
+def cmd_api(args) -> None:
+    import uvicorn
+
+    print(f"Lock-In Draft Assistant: http://{args.host}:{args.port}  (API docs at /docs)")
+    uvicorn.run("draftai.api.app:app_from_config", factory=True, host=args.host, port=args.port, reload=args.reload)
+
+
 def cmd_app(args) -> None:
     app = Paths().root / "app" / "streamlit_app.py"
     sys.exit(subprocess.call([sys.executable, "-m", "streamlit", "run", str(app), *args.streamlit_args]))
@@ -357,6 +436,7 @@ def main(argv: list[str] | None = None) -> None:
 
     p = sub.add_parser("ingest", help="fetch and normalise data")
     p.add_argument("--sleeper-only", action="store_true", help="only refresh Sleeper players and the crosswalk")
+    p.add_argument("--draft-only", action="store_true", help="only re-normalise the draft classes (from the cache)")
     p.set_defaults(fn=cmd_ingest)
 
     p = sub.add_parser("league", help="show league settings")
@@ -366,6 +446,14 @@ def main(argv: list[str] | None = None) -> None:
     p = sub.add_parser("train", help="train and evaluate projection models")
     league_args(p)
     p.set_defaults(fn=cmd_train)
+
+    p = sub.add_parser("rookies", help="refit and evaluate only the rookie model (attaches it to the saved models)")
+    league_args(p)
+    p.set_defaults(fn=cmd_rookies)
+
+    p = sub.add_parser("rates-experiment", help="compare the per-minute rate priors on the validation seasons")
+    league_args(p)
+    p.set_defaults(fn=cmd_rates)
 
     p = sub.add_parser("project", help="project the season and build the draft board")
     league_args(p)
@@ -418,6 +506,23 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--quick", action="store_true", help="small run for a smoke test")
     p.add_argument("--no-replay", action="store_true", help="skip replays of your real drafts")
     p.set_defaults(fn=cmd_backtest)
+
+    p = sub.add_parser("ltr", help="learning-to-rank experiment: collect, train, judge in the backtest (slow)")
+    league_args(p)
+    p.add_argument("--seasons", type=int, nargs="*")
+    p.add_argument("--leagues", type=int, help="simulated leagues per season to collect queries in")
+    p.add_argument("--strategies", nargs="*", help="backtest strategies (default: adp vor greedy_survival rollout ltr_sim ltr)")
+    p.add_argument("--collect-only", action="store_true")
+    p.add_argument("--no-backtest", action="store_true", help="train and evaluate offline only")
+    p.add_argument("--use-backtest-rows", action="store_true",
+                   help="judge with the last `draftai backtest` run (its strategies must include ltr, ltr_sim)")
+    p.set_defaults(fn=cmd_ltr)
+
+    p = sub.add_parser("api", help="serve the API and the React front end (FastAPI)")
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--port", type=int, default=8000)
+    p.add_argument("--reload", action="store_true", help="restart on code changes (development)")
+    p.set_defaults(fn=cmd_api)
 
     p = sub.add_parser("app", help="launch the Streamlit app")
     p.add_argument("streamlit_args", nargs="*")

@@ -105,6 +105,13 @@ class TrainConfig(BaseModel):
     )
     ridge_alpha: float = 10.0
     quantiles: list[float] = Field(default_factory=lambda: [0.1, 0.5, 0.9])
+    # V5. Rookies: "model" (ridge + comparables, models/rookies.py) or "baseline" (draft slot).
+    rookie_model: str = "model"
+    rookie_k: int = 20  # comparables per rookie
+    rookie_alpha: float = 10.0
+    # V5. Per-minute rate prior: "hierarchical" (regression prior, features/rates.py), "bucket"
+    # (height-bucket mean) or "hierarchical_scaled"; chosen by `draftai rates-experiment`.
+    rate_prior: str = "hierarchical"
 
 
 class SimConfig(BaseModel):
@@ -126,6 +133,20 @@ class SimConfig(BaseModel):
     opponent_window: int = 50
 
 
+class LTRConfig(BaseModel):
+    """The learning-to-rank experiment (V5, design section 17; backtest/ltr.py)."""
+
+    leagues: int = 24  # simulated leagues per season in which queries are collected
+    docs: int = 24  # candidates per query (the greedy recommender's top)
+    worlds: int = 150  # rollout worlds per candidate for the simulator's labels
+    epsilon: float = 0.25  # exploration while collecting: a random top-5 candidate instead of the best
+    levels: int = 10  # relevance grades per query
+    sim_rounds: int = 300  # boosting rounds on simulator labels (the distilled surrogate)
+    real_rounds: int = 100  # further rounds on realised labels (fine-tuning)
+    real_learning_rate: float = 0.03
+    seed: int = 17
+
+
 class BacktestConfig(BaseModel):
     seasons: list[int] = Field(default_factory=lambda: [2021, 2022, 2023, 2024, 2025])
     strategies: list[str] = Field(
@@ -145,6 +166,7 @@ class BacktestConfig(BaseModel):
     # "fitted" uses the model fitted on your real drafts (noisier: it reads informed
     # deviations from the proxy market as noise, so its teams are weaker than real ones).
     room: str = "calibrated"
+    ltr: LTRConfig = Field(default_factory=LTRConfig)
 
 
 def _load_yaml(path: Path) -> dict:

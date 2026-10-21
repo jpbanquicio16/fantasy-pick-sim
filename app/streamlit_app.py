@@ -394,6 +394,8 @@ def main_screen() -> None:
         st.markdown("**Why:** " + " ".join(info["why"]))
     if info.get("risk"):
         st.markdown("**Risk:** " + "; ".join(info["risk"]) + ".")
+    if info.get("comps"):
+        st.caption("Rookies like him (year-one FP/G): " + "; ".join(info["comps"]))
 
     left, right = st.columns([3, 2])
     with left:

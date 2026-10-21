@@ -197,6 +197,27 @@ def eb_prior(counts: np.ndarray, minutes: np.ndarray) -> tuple[float, float]:
 
 
 # --- feature rows --------------------------------------------------------------------
+def _bucket_rates(ss: pl.DataFrame, rows: pl.DataFrame) -> list[pl.Expr]:
+    """Empirical-Bayes shrinkage of weighted per-minute rates toward the height bucket."""
+    hist = ss.join(rows.select("player_id", "hbucket"), on="player_id", how="left").with_columns(
+        pl.col("hbucket").fill_null("unk")
+    )
+    shrunk = []
+    for c in COMPONENTS:
+        exprs = []
+        for hb in ["guard", "wing", "big", "unk"]:
+            h = hist.filter(pl.col("hbucket") == hb) if hb != "unk" else hist
+            mu, k = eb_prior(h[c].to_numpy().astype(float), h["min"].to_numpy().astype(float))
+            exprs.append((hb, mu, k))
+        expr = pl.lit(None, dtype=pl.Float64)
+        for hb, mu, k in exprs:
+            expr = pl.when(pl.col("hbucket") == hb).then(
+                (pl.col(f"{c}_wsum") + k * mu) / (pl.col("min_w") + k)
+            ).otherwise(expr)
+        shrunk.append(expr.alias(f"rate_{c}"))
+    return shrunk
+
+
 def _lagged(seasons: pl.DataFrame, target: int, lag: int, cols: list[str]) -> pl.DataFrame:
     return seasons.filter(pl.col("season") == target - lag).select(
         "player_id", *[pl.col(c).alias(f"{c}_{lag}") for c in cols]
@@ -212,6 +233,7 @@ def build_features(
     settings: ScoringSettings,
     pool: pl.DataFrame | None = None,
     newcomers: pl.DataFrame | None = None,
+    rate_prior: str = "bucket",
 ) -> pl.DataFrame:
     """Feature rows for ``target_season`` from games strictly before ``view.as_of``.
 
@@ -310,24 +332,21 @@ def build_features(
         .with_columns((pl.col("age") ** 2).alias("age2"))
     )
 
-    # Empirical-Bayes shrinkage of weighted per-minute rates toward the height bucket.
-    hist = ss.join(rows.select("player_id", "hbucket"), on="player_id", how="left").with_columns(
-        pl.col("hbucket").fill_null("unk")
-    )
-    shrunk = []
-    for c in COMPONENTS:
-        exprs = []
-        for hb in ["guard", "wing", "big", "unk"]:
-            h = hist.filter(pl.col("hbucket") == hb) if hb != "unk" else hist
-            mu, k = eb_prior(h[c].to_numpy().astype(float), h["min"].to_numpy().astype(float))
-            exprs.append((hb, mu, k))
-        expr = pl.lit(None, dtype=pl.Float64)
-        for hb, mu, k in exprs:
-            expr = pl.when(pl.col("hbucket") == hb).then(
-                (pl.col(f"{c}_wsum") + k * mu) / (pl.col("min_w") + k)
-            ).otherwise(expr)
-        shrunk.append(expr.alias(f"rate_{c}"))
-    rows = rows.with_columns(shrunk)
+    if rate_prior.startswith("hierarchical"):
+        # Shrinkage toward a regression prior: size, age, experience, draft slot (features/rates.py).
+        from draftai.features.rates import hierarchical_rates
+
+        people = (ss.select("player_id").unique().join(b, on="player_id", how="left").join(d, on="player_id", how="left")
+                  .join(first_season, on="player_id", how="left")
+                  .with_columns(pl.coalesce("draft_year", "bio_draft_year").alias("draft_year"),
+                                pl.coalesce("draft_pick", "bio_draft_pick").alias("draft_pick")))
+        hist = ss.select("player_id", "season", "min", *COMPONENTS).join(people, on="player_id", how="left").with_columns(
+            (pl.col("age_last") + (pl.col("season") - pl.col("age_season"))).alias("age"),
+            (pl.col("season") - pl.coalesce(pl.col("draft_year"), pl.col("first_season"))).alias("experience"),
+            height_bucket(pl.col("height_in")).alias("hbucket"))
+        rows = rows.with_columns(hierarchical_rates(rows, hist, COMPONENTS, Y, scaled=rate_prior == "hierarchical_scaled"))
+    else:
+        rows = rows.with_columns(_bucket_rates(ss, rows))
 
     # Team context at the cut-off.
     ts = team_season_stats(tg)
@@ -356,7 +375,7 @@ COMPONENT_FEATURES = [
     "gp_1", "gp_2", "gp_3", "mpg_1", "mpg_2", "mpg_3", "share_1", "share_2", "share_3",
     "min_w", "mpg_w", "share_w", "mpg_trend", "min_last20", "last20_minus_mpg", "usage_1", "usage_2",
     "used_per_min_w", "longest_absence", "q_short", "age", "age2", "experience", "log_draft_pick",
-    "height_in", "new_team", "team_pace_1", "opp_team_mpg", "opp_pos_mpg",
+    "height_in", "new_team", "team_pace_1", "opp_team_mpg", "opp_pos_mpg", "opp_own_mpg",
     *[f"rate_{c}" for c in COMPONENTS],
 ]
 FP_FEATURES = COMPONENT_FEATURES + [
@@ -409,6 +428,7 @@ def build_training_set(
     settings: ScoringSettings,
     seasons: list[int],
     log=lambda *_: None,
+    rate_prior: str = "bucket",
 ) -> pl.DataFrame:
     frames = []
     for Y in seasons:
@@ -416,7 +436,7 @@ def build_training_set(
         view = AsOf.view(player_games, team_games, cut)
         roster = roster_from_first_game(player_games, Y)
         feats = build_features(view, Y, roster, bio, draft, settings,
-                               newcomers=draft_class_newcomers(view, draft, Y, roster, settings))
+                               newcomers=draft_class_newcomers(view, draft, Y, roster, settings), rate_prior=rate_prior)
         targets, team_gp = build_targets(player_games, team_games, Y, settings)
         rows = feats.join(targets, on="player_id", how="left").with_columns(
             pl.col("y_gp").fill_null(0),

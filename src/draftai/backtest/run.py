@@ -178,9 +178,14 @@ def run_season(season: int, rules: LeagueRules, sim: SimConfig, train_cfg: Train
     room = Room.build(sd, rules, model)
     rcfg = RolloutConfig(worlds=bt.rollout_worlds, shortlist=bt.rollout_shortlist, race_after=bt.rollout_race_after,
                          waiver_slots=sim.waiver_slots, seed=bt.seed + season)
-    strategies: list[Strategy] = build(bt.strategies)
-    for s in strategies:
-        s.prepare(sd, room.needs, room.evaluator, model, sim, rcfg)
+    strategies: list[Strategy] = []
+    skipped = []
+    for s in build(bt.strategies, paths):
+        try:
+            s.prepare(sd, room.needs, room.evaluator, model, sim, rcfg)
+            strategies.append(s)
+        except FileNotFoundError:  # a learning-to-rank strategy before `draftai ltr` trained it
+            skipped.append(s.name)
     base = KeyGreedy("vor", "vor")
     base.prepare(sd, room.needs, room.evaluator, model, sim, rcfg)
     weeks_weight = float(sd.board.weights.sum())
@@ -209,7 +214,7 @@ def run_season(season: int, rules: LeagueRules, sim: SimConfig, train_cfg: Train
                 for c in calibration_rows(room, s.decisions, uniforms, base):
                     calib.append({"season": season, "league": league, **c})
     meta = {"season": season, **sd.meta, "market_tests": market_tests(sd), "opponents": model.describe(),
-            "seconds": round(time.time() - t0, 1)}
+            "seconds": round(time.time() - t0, 1), "skipped_strategies": skipped}
     return {"rows": rows, "calibration": calib, "meta": meta}
 
 
@@ -328,7 +333,7 @@ def write_report(res: BacktestResult, rules: LeagueRules, bt: BacktestConfig, ou
     g = gate(res.rows)
     strategies = res.rows["strategy"].unique().to_list()
     pairs = []
-    for s in [x for x in ("rollout", "greedy_survival", "vor", "points", "oracle") if x in strategies]:
+    for s in [x for x in ("rollout", "ltr", "ltr_sim", "greedy_survival", "vor", "points", "oracle") if x in strategies]:
         for base in ("adp", "vor"):
             if base == s or base not in strategies:
                 continue

@@ -87,8 +87,9 @@ class SeasonData:
 
 
 # --- models -----------------------------------------------------------------------------
-def fold_models(season: int, train_cfg: TrainConfig, paths: Paths, log=print):
-    """Models trained only on target seasons before ``season`` (cached on disk).
+def fold_models(season: int, train_cfg: TrainConfig, paths: Paths, log=print, settings: ScoringSettings | None = None):
+    """Models trained only on target seasons (and draft classes) before ``season``, cached
+    on disk.
 
     Blend weights and conformal corrections come from the trained manifest; they were
     chosen on the rolling validation seasons, so for those seasons the backtest carries a
@@ -97,20 +98,45 @@ def fold_models(season: int, train_cfg: TrainConfig, paths: Paths, log=print):
     import json
     from datetime import date
 
-    from draftai.features.build import FP_FEATURES
     from draftai.models.artifacts import load_models, save_models
-    from draftai.models.train import _fit, _new_models
+    from draftai.models.train import _fit, _new_models, projection_signature
+
+    signature = projection_signature(train_cfg)
 
     def current(directory: Path) -> bool:
-        """Saved with today's feature set (older folds are refitted after a feature change)."""
+        """Saved with today's feature set and projection setup (older folds are refitted)."""
         m = directory / "manifest.json"
-        return m.exists() and json.loads(m.read_text())["fp_q"]["features"] == FP_FEATURES
+        if not m.exists():
+            return False
+        man = json.loads(m.read_text())
+        return man.get("signature", {}) == signature
+
+    def with_rookies(models, directory: Path):
+        if train_cfg.rookie_model != "model":
+            models.rookies = None
+            return models
+        if models.rookies is not None:
+            return models
+        import joblib
+
+        from draftai.models.rookies import RookieModel, class_rows
+
+        pg, tg = tables.load_table("player_games", paths), tables.load_table("team_games", paths)
+        bio, dr = tables.load_table("player_bio", paths), tables.load_table("draft_class", paths)
+        rows = class_rows(pg, tg, bio, dr, settings or ScoringSettings(), range(int(dr["draft_year"].min()), season))
+        final = load_models(paths.artifacts / "models" / "final").rookies
+        adj = (final.adj_fp, final.adj_share) if final is not None else ((0.0, 0.0), (0.0, 0.0))
+        models.rookies = RookieModel(alpha=train_cfg.rookie_alpha, k=train_cfg.rookie_k, adj_fp=adj[0],
+                                     adj_share=adj[1]).fit(rows, settings or ScoringSettings())
+        joblib.dump(models.rookies, directory / "rookies.joblib")
+        log(f"rookie model for {season}: draft classes before {season}")
+        return models
 
     if season == train_cfg.test_season and current(paths.artifacts / "models" / "test"):
-        return load_models(paths.artifacts / "models" / "test")
+        return with_rookies(load_models(paths.artifacts / "models" / "test"), paths.artifacts / "models" / "test")
     d = paths.artifacts / "models" / f"fold_{season}"
     if current(d):
-        return load_models(d)
+        return with_rookies(load_models(d), d)
 
     final = json.loads((paths.artifacts / "models" / "final" / "manifest.json").read_text())
     ts = pl.read_parquet(paths.features / "training_set.parquet")
@@ -124,7 +150,7 @@ def fold_models(season: int, train_cfg: TrainConfig, paths: Paths, log=print):
     models.share_q.adj_lo, models.share_q.adj_hi = final["share_q"]["adj"]
     save_models(models, d, train_cfg, date.today(), {"trained_through": season - 1})
     log(f"fold models for {season}: trained on {train_cfg.first_target_season}-{season - 1}")
-    return models
+    return with_rookies(models, d)
 
 
 # --- the pool and positions ---------------------------------------------------------------
@@ -236,7 +262,7 @@ def build_season(season: int, rules: LeagueRules, sim: SimConfig, train_cfg: Tra
     pg, tg = tables.load_table("player_games", paths), tables.load_table("team_games", paths)
     bio, dr = tables.load_table("player_bio", paths), tables.load_table("draft_class", paths)
     cut = season_cutoff(tg, season)
-    models = fold_models(season, train_cfg, paths, log)
+    models = fold_models(season, train_cfg, paths, log, settings=rules.scoring)
     pool = season_pool(pg, dr, season)
     proj = season_projections(pg, tg, bio, dr, models, rules.scoring, season, cut, pool.select("player_id", "team"),
                               pool=pool.select("player_id"))
@@ -328,16 +354,22 @@ def realise(board: Board, season: int, pg: pl.DataFrame, tg: pl.DataFrame, setti
 
 
 # --- cache ----------------------------------------------------------------------------------
-def season_key(season: int, rules: LeagueRules, sim: SimConfig, game_samples: int) -> str:
-    """Seasons are cached per league shape; league size only moves VOR, so it is left out
-    and applied with ``Board.with_teams`` instead."""
+def season_key(season: int, rules: LeagueRules, sim: SimConfig, game_samples: int,
+               train_cfg: TrainConfig | None = None) -> str:
+    """Seasons are cached per league shape and projection setup (features, rate prior,
+    rookie model); league size only moves VOR, so it is left out and applied with
+    ``Board.with_teams`` instead."""
     import hashlib
     import json
 
+    from draftai.models.train import projection_signature
+
+    cfg = train_cfg or TrainConfig()
     blob = json.dumps({"season": season, "roster": rules.roster_positions, "scoring": rules.scoring.weights,
                        "stack": rules.scoring.bonus_stacking, "po": [rules.playoff_week_start, rules.playoff_teams,
                        rules.playoff_round_type, rules.playoff_weight], "seed": sim.seed, "samples": game_samples,
-                       "donors": [sim.min_donor_games, sim.donor_neighbours], "v": 4}, sort_keys=True)
+                       "donors": [sim.min_donor_games, sim.donor_neighbours], **projection_signature(cfg),
+                       "rookies": [cfg.rookie_model, cfg.rookie_k, cfg.rookie_alpha], "v": 5}, sort_keys=True)
     return f"{season}_{hashlib.sha256(blob.encode()).hexdigest()[:10]}"
 
 
@@ -363,12 +395,13 @@ def load_season(directory: Path) -> SeasonData:
 def season_data(season: int, rules: LeagueRules, sim: SimConfig, train_cfg: TrainConfig, paths: Paths,
                 game_samples: int = 2000, log=print) -> SeasonData:
     """Build (or load the cached) season, then size the board to this league."""
-    d = paths.artifacts / "backtest" / "seasons" / season_key(season, rules, sim, game_samples)
+    d = paths.artifacts / "backtest" / "seasons" / season_key(season, rules, sim, game_samples, train_cfg)
     if (d / "season_meta.json").exists():
         sd = load_season(d)
     else:
         sd = build_season(season, rules, sim, train_cfg, paths, game_samples, log)
         save_season(sd, d)
+    sd.meta["cache_key"] = d.name
     if sd.board.teams != rules.teams:
         sd.board = sd.board.with_teams(rules.teams)
     return sd

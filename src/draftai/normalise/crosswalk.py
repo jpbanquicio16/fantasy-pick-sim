@@ -50,6 +50,14 @@ def name_variants(name: str) -> set[str]:
     return out
 
 
+def _number(v) -> float | None:
+    """Sleeper sends height and weight as strings ("80", "205"); blanks become null."""
+    try:
+        return float(v) if v not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
 def sleeper_players_table(players: dict[str, dict], snapshot: date | None = None) -> pl.DataFrame:
     rows = []
     for pid, p in players.items():
@@ -70,11 +78,16 @@ def sleeper_players_table(players: dict[str, dict], snapshot: date | None = None
                 "years_exp": p.get("years_exp"),
                 "active": bool(p.get("active")),
                 "status": p.get("status"),
+                # Rookie-model inputs for players with no NBA bio yet.
+                "height_in": _number(p.get("height")),
+                "weight_lb": _number(p.get("weight")),
+                "college": p.get("college"),
             }
         )
     df = pl.DataFrame(
         rows,
-        schema_overrides={"positions": pl.List(pl.Utf8), "search_rank": pl.Int64, "years_exp": pl.Int64},
+        schema_overrides={"positions": pl.List(pl.Utf8), "search_rank": pl.Int64, "years_exp": pl.Int64,
+                          "height_in": pl.Float64, "weight_lb": pl.Float64, "college": pl.Utf8},
     )
     return df.with_columns(
         pl.col("birth_date").str.to_date(strict=False),

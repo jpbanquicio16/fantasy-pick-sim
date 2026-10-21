@@ -24,7 +24,7 @@ def _prev(stints: list[tuple[int, str, float]]) -> pl.DataFrame:
 
 def _rows(players: list[dict]) -> pl.DataFrame:
     base = {"min_1": 2000.0, "mpg_w": 25.0, "gp_1": 80, "gp_2": 80, "share_1": 0.95, "share_2": 0.95,
-            "share_3": 0.95, "longest_absence": 0}
+            "share_3": 0.95, "share_w": 0.95, "longest_absence": 0}
     return pl.DataFrame([{**base, **p} for p in players])
 
 

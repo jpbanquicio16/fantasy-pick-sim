@@ -57,11 +57,13 @@ def train(train_cfg: TrainConfig, settings: ScoringSettings, paths: Paths, log=p
     pg, tg = tables.load_table("player_games", paths), tables.load_table("team_games", paths)
     bio, dr = tables.load_table("player_bio", paths), tables.load_table("draft_class", paths)
     seasons = list(range(train_cfg.first_target_season, train_cfg.test_season + 1))
-    ts = build_training_set(pg, tg, bio, dr, settings, seasons, log=log)
+    ts = build_training_set(pg, tg, bio, dr, settings, seasons, log=log, rate_prior=train_cfg.rate_prior)
     paths.features.mkdir(parents=True, exist_ok=True)
     ts.write_parquet(paths.features / "training_set.parquet")
     result = train_all(ts, settings, train_cfg, log=log)
     report = write_report(result, paths.artifacts / "reports")
+    result.models_test.rookies, result.models_final.rookies = rookie_models(pg, tg, bio, dr, train_cfg, settings,
+                                                                            paths, log)
     snap = date.today()
     save_models(result.models_test, models_dir(paths, "test"), train_cfg, snap,
                 {"trained_through": train_cfg.test_season - 1, "summary": result.summary})
@@ -70,6 +72,34 @@ def train(train_cfg: TrainConfig, settings: ScoringSettings, paths: Paths, log=p
     result.test_rows.write_parquet(paths.artifacts / "reports" / "test_rows.parquet")
     log(f"report: {report}")
     return result
+
+
+def rookie_models(pg, tg, bio, dr, train_cfg: TrainConfig, settings: ScoringSettings, paths: Paths, log=print):
+    """Evaluate the rookie model against the draft-slot baseline (rolling origin by draft
+    class, then the test class once) and return the (test, final) models to project with:
+    ``None`` for both when the config chooses the baseline."""
+    from draftai.models.rookies import evaluate_rookies, write_rookie_report
+
+    ev = evaluate_rookies(pg, tg, bio, dr, settings, train_cfg.validation_seasons, train_cfg.test_season,
+                          alpha=train_cfg.rookie_alpha, k=train_cfg.rookie_k, log=log)
+    log(f"rookie report: {write_rookie_report(ev, paths.artifacts / 'reports')}")
+    if train_cfg.rookie_model == "baseline":
+        return None, None
+    return ev.model_test, ev.model_final
+
+
+def train_rookies(train_cfg: TrainConfig, settings: ScoringSettings, paths: Paths, log=print) -> None:
+    """Refit only the rookie model and attach it to the saved test and final models."""
+    import joblib
+
+    pg, tg = tables.load_table("player_games", paths), tables.load_table("team_games", paths)
+    bio, dr = tables.load_table("player_bio", paths), tables.load_table("draft_class", paths)
+    for kind, model in zip(("test", "final"), rookie_models(pg, tg, bio, dr, train_cfg, settings, paths, log)):
+        f = models_dir(paths, kind) / "rookies.joblib"
+        if model is None:
+            f.unlink(missing_ok=True)
+        elif f.parent.exists():
+            joblib.dump(model, f)
 
 
 # --- project + board ---------------------------------------------------------------
@@ -139,12 +169,16 @@ def project(ctx: LeagueContext, sim: SimConfig, paths: Paths, as_of: date | None
     as_of = as_of or min(date.today(), sched["game_date"].min())
     roster, pool, unmatched = live_inputs(paths)
     models = load_models(models_dir(paths, "final"))
-    proj = season_projections(pg, tg, bio, dr, models, ctx.scoring, Y, as_of, roster, pool=pool,
-                              extra_rookies=unmatched.select("player_id", "team"), explain=True)
     sp = tables.load_table("sleeper_players", paths)
     cw = tables.load_table("crosswalk", paths)
     ids = pl.concat([cw.select(pl.col("nba_id").alias("player_id"), "sleeper_id"),
                      unmatched.select("player_id", "sleeper_id")])
+    from draftai.models.rookies import sleeper_attributes
+
+    # Rookies have no NBA bio yet: age, height and weight from Sleeper's players file.
+    attrs = ids.join(sleeper_attributes(sp, Y), on="sleeper_id", how="inner").drop("sleeper_id")
+    proj = season_projections(pg, tg, bio, dr, models, ctx.scoring, Y, as_of, roster, pool=pool,
+                              extra_rookies=unmatched.select("player_id", "team"), explain=True, rookie_attrs=attrs)
     proj = (
         proj.join(ids, on="player_id", how="inner")
         .join(sp.select("sleeper_id", pl.col("full_name").alias("name"), pl.col("team").alias("sleeper_team"), "positions",

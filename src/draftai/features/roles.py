@@ -77,14 +77,15 @@ def returning_minutes() -> pl.Expr:
 def opportunity(rows: pl.DataFrame, prev_games: pl.DataFrame, newcomers: pl.DataFrame | None) -> pl.DataFrame:
     """Add net minutes opportunity at the cut-off to the feature rows.
 
-    ``rows`` needs player_id, team_now, hbucket, min_1, mpg_w, gp_1, gp_2, share_1-3 and
-    longest_absence. ``prev_games`` are last season's player games (as-of). ``newcomers``
+    ``rows`` needs player_id, team_now, hbucket, min_1, mpg_w, gp_1, gp_2, share_1-3,
+    share_w and longest_absence. ``prev_games`` are last season's player games (as-of). ``newcomers``
     (player_id, team, mpg, share) are rookies and other players with no recent history.
 
     Adds the four channels (``opp_dep``, ``opp_arr``, ``opp_new``, ``opp_ret``; position
     weighted, minutes per team game, each positive), the features ``opp_pos_mpg`` (their
-    net) and ``opp_team_mpg`` (the unweighted net), and the newcomer sums the minutes
-    budget's evaluation needs (``team_new_emin``, ``team_new_wt``).
+    net), ``opp_team_mpg`` (the unweighted net) and ``opp_own_mpg`` (his elastic share of
+    ``opp_pos_mpg``), and the newcomer sums the minutes budget's evaluation needs
+    (``team_new_emin``, ``team_new_wt``).
     """
     n_games = prev_games.select("team", "game_id").unique().group_by("team").len()["len"]
     G = float(n_games.median()) if n_games.len() else TEAM_GAMES
@@ -137,12 +138,64 @@ def opportunity(rows: pl.DataFrame, prev_games: pl.DataFrame, newcomers: pl.Data
     per[ti < 0] = 0.0
     flat[ti < 0] = 0.0
     sign = np.array([1.0, -1.0, -1.0, -1.0])
+    opp_pos = per @ sign
+    # His share of that opportunity: by elasticity among teammates at his positions (himself
+    # included), so a 36-minute starter takes little of it and a rotation player much more.
+    e = elasticity(r["mpg_w"].fill_null(0.0).to_numpy()) * r["share_w"].fill_null(0.0).clip(0.0, 1.0).to_numpy()
+    mass = np.zeros((len(teams), len(BUCKETS)))
+    np.add.at(mass, (np.maximum(ti, 0), bi), np.where(ti >= 0, e, 0.0))
+    W = np.einsum("pb,pb->p", weights, mass[np.maximum(ti, 0)])
+    own_share = np.where(W > 1e-9, e / np.maximum(W, 1e-9), 0.0)
     out = r.drop("_arr", "_ret", "min_here").with_columns(
         *[pl.Series(c, per[:, c_idx[c]]) for c in CHANNELS],
-        pl.Series("opp_pos_mpg", per @ sign),
+        pl.Series("opp_pos_mpg", opp_pos),
         pl.Series("opp_team_mpg", flat @ sign),
+        pl.Series("opp_own_mpg", opp_pos * own_share),
     )
     return out.with_columns(*newcomer_budget_columns(newcomers))
+
+
+def team_bucket_net(roster: pl.DataFrame, prev_games: pl.DataFrame, buckets: pl.DataFrame) -> pl.DataFrame:
+    """Veteran minutes per team game each team opened at each height bucket since last
+    season: departures minus arrivals, relative to the league's average team (the rookie
+    model's "vacated minutes"). Rookies are not counted: this is the room they walk into.
+
+    ``roster`` (player_id, team) is the team at the cut-off, ``prev_games`` last season's
+    player games, ``buckets`` (player_id, hbucket). Returns team, hbucket, net.
+    """
+    n_games = prev_games.select("team", "game_id").unique().group_by("team").len()["len"]
+    G = float(n_games.median()) if n_games.len() else TEAM_GAMES
+    G = G if G > 0 else TEAM_GAMES
+    stints = prev_games.group_by("player_id", "team").agg(pl.col("min").sum().alias("stint_min"))
+    now = roster.select("player_id", pl.col("team").alias("team_now")).join(buckets, on="player_id", how="left") \
+        .with_columns(pl.col("hbucket").fill_null("unk"))
+    moved = stints.join(now, on="player_id", how="inner").filter(pl.col("team") != pl.col("team_now"))
+    dep = moved.select("team", "hbucket", (pl.col("stint_min") / G).alias("v"))
+    arr = moved.select(pl.col("team_now").alias("team"), "hbucket", (-pl.col("stint_min") / G).alias("v"))
+    teams = sorted(set(now["team_now"].drop_nulls().to_list()) | set(stints["team"].drop_nulls().to_list()))
+    grid = pl.DataFrame({"team": teams}).join(pl.DataFrame({"hbucket": list(BUCKETS)}), how="cross")
+    net = grid.join(pl.concat([dep, arr]).group_by("team", "hbucket").agg(pl.col("v").sum()),
+                    on=["team", "hbucket"], how="left").with_columns(pl.col("v").fill_null(0.0))
+    return net.with_columns((pl.col("v") - pl.col("v").mean().over("hbucket")).alias("net")).select(
+        "team", "hbucket", "net")
+
+
+def bucket_weighted(net: pl.DataFrame, team: list, hbucket: list) -> tuple[np.ndarray, np.ndarray]:
+    """For each (team, height bucket): the team's net opened minutes weighted toward that
+    bucket (``SIM_MATRIX``), and unweighted (summed over buckets)."""
+    t_idx = {t: i for i, t in enumerate(sorted(set(net["team"].to_list())))}
+    b_idx = {b: i for i, b in enumerate(BUCKETS)}
+    M = np.zeros((max(len(t_idx), 1), len(BUCKETS)))
+    for t, b, v in net.iter_rows():
+        M[t_idx[t], b_idx[b]] = v
+    ti = np.array([t_idx.get(t, -1) for t in team], dtype=int)
+    bi = np.array([b_idx.get(b or "unk", 3) for b in hbucket], dtype=int)
+    rows = M[np.maximum(ti, 0)]
+    pos = np.einsum("pb,pb->p", SIM_MATRIX[bi], rows)
+    flat = rows.sum(axis=1)
+    pos[ti < 0] = 0.0
+    flat[ti < 0] = 0.0
+    return pos, flat
 
 
 def newcomer_budget_columns(newcomers: pl.DataFrame | None) -> list[pl.Expr]:

@@ -118,9 +118,13 @@ def replay(rd: RealDraft, sim: SimConfig, train_cfg: TrainConfig, bt: BacktestCo
     room = Room.build(sd, rd.rules, model)
     rcfg = RolloutConfig(worlds=bt.rollout_worlds, shortlist=bt.rollout_shortlist, race_after=bt.rollout_race_after,
                          waiver_slots=sim.waiver_slots, seed=bt.seed + rd.season)
-    strats: list[Strategy] = build(strategies)
-    for s in strats:
-        s.prepare(sd, room.needs, room.evaluator, model, sim, rcfg)
+    strats: list[Strategy] = []
+    for s in build(strategies, paths):
+        try:
+            s.prepare(sd, room.needs, room.evaluator, model, sim, rcfg)
+            strats.append(s)
+        except FileNotFoundError:  # a learning-to-rank strategy before `draftai ltr` trained it
+            log(f"replay {rd.label}: skipping {s.name} (no ranker)")
     owners = _owners(rd)
     row_of = {s: i for i, s in enumerate(room.ids)}
     actual = {no: row_of.get(sid) for no, _, sid in rd.picks}

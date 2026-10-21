@@ -9,10 +9,17 @@ import numpy as np
 import polars as pl
 
 from draftai.features.asof import AsOf
-from draftai.features.build import COMPONENTS, build_features, rookie_rows
+from draftai.features.build import build_features, rookie_rows
 from draftai.features.roles import newcomer_minutes, team_minutes_target
 from draftai.models.budget import apply_budget, apply_overrides
-from draftai.models.rookies import pick_bucket, rookie_baseline
+from draftai.models.rookies import (
+    bio_attributes,
+    rookie_baseline,
+    rookie_context,
+    rookie_features,
+    rookie_model_projections,
+    rookie_projections,
+)
 from draftai.scoring import ScoringSettings
 
 Q_PRIOR_GAMES = 20.0  # shrinkage of the short-absence rate toward the league mean, in games
@@ -45,44 +52,25 @@ def project_rows(feats: pl.DataFrame, models, settings: ScoringSettings) -> pl.D
     ).with_columns(pl.lit(False).alias("rookie"), pl.lit(q_lg).alias("q_league"))
 
 
-def rookie_projections(
-    rookies: pl.DataFrame, baseline: pl.DataFrame, q_league: float, settings: ScoringSettings
-) -> pl.DataFrame:
-    """Draft-slot baseline: each rookie gets his pick bucket's first-year outcomes."""
-    from draftai.models.components import linear_fp
-
-    known = set(baseline["bucket"].to_list())
-    # Undrafted signings have no draft-class history; the second round is the closest proxy.
-    r = rookies.with_columns(pick_bucket(pl.col("draft_pick")).alias("bucket")).with_columns(
-        pl.when(pl.col("bucket").is_in(list(known))).then(pl.col("bucket")).otherwise(pl.lit("31-60")).alias("bucket")
-    ).join(baseline, on="bucket", how="left")
-    rates = {c: r[f"rate_{c}"].fill_null(0).to_numpy() for c in COMPONENTS}
-    mpg = r["mpg"].fill_null(10.0).to_numpy()
-    lin = linear_fp(rates, mpg, settings) + r["bonus_pg"].fill_null(0).to_numpy()
-    return r.select(
-        "player_id", "season",
-        pl.col("mpg").alias("mpg_hat"),
-        pl.col("share").alias("share_hat"),
-        *[pl.col(f"rate_{c}").alias(f"rate_{c}_hat") for c in COMPONENTS],
-        pl.col("bonus_pg").alias("bonus_hat"),
-        pl.Series("fp_pg_hat", lin),
-        pl.Series("fp_direct_hat", lin),
-        pl.col("fp_pg_p10").alias("fp_p10"), pl.col("fp_pg_p50").alias("fp_p50"), pl.col("fp_pg_p90").alias("fp_p90"),
-        pl.col("share_p10"), pl.col("share").alias("share_p50"), pl.col("share_p90"),
-        pl.lit(q_league).alias("q_short_hat"),
-        pl.coalesce("team", "draft_team").alias("team_now") if "team" in r.columns else pl.col("draft_team").alias("team_now"),
-        pl.lit(None, dtype=pl.Float64).alias("age"),
-        pl.lit(None, dtype=pl.Float64).alias("fp_pg_1"),
-        pl.lit(None, dtype=pl.Float64).alias("share_1"),
-        pl.lit(None, dtype=pl.Float64).alias("gp_1"),
-        pl.lit(None, dtype=pl.Float64).alias("mpg_1"),
-        pl.lit(None, dtype=pl.Float64).alias("fp_pg_w"),
-        pl.lit(None, dtype=pl.Float64).alias("share_w"),
-        pl.lit(True).alias("rookie"),
-        pl.lit(q_league).alias("q_league"),
-        pl.col("donor_ids"),
-        pl.col("bucket"),
-    )
+def model_rookie_features(rk: pl.DataFrame, view: AsOf, roster: pl.DataFrame, bio: pl.DataFrame, draft: pl.DataFrame,
+                          target_season: int, attrs: pl.DataFrame | None = None) -> pl.DataFrame:
+    """The rookie model's inputs for ``rk`` (player_id, draft_pick, draft_team, team,
+    season): background from the draft history, attributes from ``attrs`` and then the
+    bio, team context from the as-of view and every player's team at the cut-off."""
+    org = (draft.filter(pl.col("draft_year") <= target_season).sort("draft_year").group_by("player_id")
+           .agg((pl.col("org_type").last() if "org_type" in draft.columns else pl.lit(None, dtype=pl.Utf8))
+                .alias("org_type"), pl.col("player_name").last()))
+    known = bio_attributes(bio, target_season)
+    if attrs is not None and attrs.height:
+        known = pl.concat([attrs.select("player_id", pl.col("age").cast(pl.Float64), pl.col("height_in").cast(pl.Float64),
+                                        pl.col("weight_lb").cast(pl.Float64)), known], how="vertical_relaxed")
+        known = known.group_by("player_id", maintain_order=True).agg(
+            pl.col("age").drop_nulls().first(), pl.col("height_in").drop_nulls().first(),
+            pl.col("weight_lb").drop_nulls().first())
+    base = rk.select("player_id", "season", "draft_pick", pl.coalesce("team", "draft_team").alias("team")) \
+        .join(org, on="player_id", how="left").join(known, on="player_id", how="left")
+    ctx = rookie_context(view.player_games, view.team_games, roster, bio, target_season)
+    return rookie_features(base, ctx)
 
 
 def season_projections(
@@ -98,13 +86,17 @@ def season_projections(
     pool: pl.DataFrame | None = None,
     extra_rookies: pl.DataFrame | None = None,
     explain: bool = False,
+    rookie_attrs: pl.DataFrame | None = None,
 ) -> pl.DataFrame:
-    """Veterans from the models, rookies from the draft-slot baseline, then the team
-    minutes budget over both (``models.minutes_budget`` is its strength; 0 turns it off).
+    """Veterans from the models, rookies from the rookie model (``models.rookies``; the
+    draft-slot baseline when there is none), then the team minutes budget over both
+    (``models.minutes_budget`` is its strength; 0 turns it off).
 
     ``roster`` (player_id, team) is the team at the cut-off. ``extra_rookies``
     (player_id, team) adds players with no NBA history who are not in the draft class
-    (undrafted signings, international players); they get the undrafted baseline.
+    (undrafted signings, international players); they are projected as undrafted.
+    ``rookie_attrs`` (player_id, age, height_in, weight_lb) are the rookies' attributes
+    when the NBA's bio has none yet (live: from Sleeper).
     """
     view = AsOf.view(player_games, team_games, as_of)
     recent = view.player_games.filter(pl.col("season") >= target_season - 3).select("player_id").unique()
@@ -128,14 +120,22 @@ def season_projections(
     newcomers = newcomer_minutes(rk.select("player_id", pl.coalesce("team", "draft_team").alias("team"), "draft_pick"),
                                  base) if rk.height else None
 
-    feats = build_features(view, target_season, roster, bio, draft, settings, pool=vet_pool, newcomers=newcomers)
+    feats = build_features(view, target_season, roster, bio, draft, settings, pool=vet_pool, newcomers=newcomers,
+                           rate_prior=getattr(models, "rate_prior", "bucket"))
     vets = project_rows(feats, models, settings)
     if explain and vets.height:
         from draftai.models.explain import projection_drivers
 
         vets = vets.join(projection_drivers(models, feats), on="player_id", how="left")
     q_lg = float(vets["q_league"][0]) if vets.height else 0.06
-    rooks = rookie_projections(rk, base, q_lg, settings) if rk.height else None
+    rooks = None
+    if rk.height:
+        model = getattr(models, "rookies", None)
+        if model is None:
+            rooks = rookie_projections(rk, base, q_lg, settings)
+        else:
+            rf = model_rookie_features(rk, view, teams, bio, draft, target_season, rookie_attrs)
+            rooks = rookie_model_projections(rf, model, q_lg, settings)
     out = vets if rooks is None else pl.concat([vets, rooks], how="diagonal_relaxed")
     out = apply_budget(out, team_minutes_target(view.team_games), getattr(models, "minutes_budget", 0.0), settings)
     return out.with_columns(pl.lit(as_of).alias("as_of"))

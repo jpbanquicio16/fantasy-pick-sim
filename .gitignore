@@ -8,3 +8,5 @@ data/*
 configs/league.yaml
 *.egg-info/
 .DS_Store
+web/node_modules/
+web/dist/

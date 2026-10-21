@@ -18,3 +18,8 @@ lgbm:
   colsample_bytree: 0.8
   reg_lambda: 1.0
   verbose: -1
+# V5
+rate_prior: hierarchical      # per-minute rate prior: hierarchical | bucket | hierarchical_scaled (rates-experiment)
+rookie_model: model           # rookies: model (ridge + comparables) | baseline (draft slot)
+rookie_k: 20                  # comparables per rookie
+rookie_alpha: 10.0

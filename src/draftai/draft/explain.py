@@ -106,7 +106,8 @@ def card(rec: Recommendation, board_players: pl.DataFrame, settings: ScoringSett
         if ra["share_hat"] + 0.03 < rb["share_hat"]:
             risk.append(f"availability {ra['share_hat']:.0%} of games ({b.name}: {rb['share_hat']:.0%})")
         if ra.get("rookie"):
-            risk.append("rookie: draft-slot baseline, widest intervals")
+            how = "comparables model" if ra.get("rookie_source") == "model" else "draft-slot baseline"
+            risk.append(f"rookie ({how}): widest intervals")
         if ra.get("injury_status"):
             risk.append(f"injury status: {ra['injury_status']}")
     from draftai.models.explain import top_drivers
@@ -135,6 +136,7 @@ def card(rec: Recommendation, board_players: pl.DataFrame, settings: ScoringSett
         "confidence": confidence,
         "edge_se": edge_se,
         "rollout_worlds": rollout.worlds if rollout is not None else None,
+        "comps": list(ra.get("comps") or [])[:3] if ra.get("rookie") else [],
     }
 
 
@@ -169,6 +171,8 @@ def render(c: dict) -> str:
                      f"{c['rollout_worlds']} simulated drafts and seasons")
     if c.get("drivers"):
         lines.append("Projection drivers   " + ", ".join(f"{g} {v:+.1f}" for g, v in c["drivers"]))
+    if c.get("comps"):
+        lines.append("Rookies like him     " + "; ".join(c["comps"]) + " (year-one FP/G)")
     if c["why"]:
         lines += ["", "Why:  " + "\n      ".join(c["why"])]
     if c["risk"]:
